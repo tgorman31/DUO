@@ -394,6 +394,10 @@ export const weekTypeDayIntents = sqliteTable("week_type_day_intents", {
   progressionTrackId: text("progression_track_id").references(() => progressionTracks.id),
   locationId: text("location_id").references(() => trainingLocations.id),
   priorityEmphasis: text("priority_emphasis").notNull().default("balanced"),
+  category: text("category").notNull().default("hard"),
+  workoutKind: text("workout_kind").notNull().default(""),
+  details: text("details").notNull().default(""),
+  isQualityIntent: integer("is_quality_intent", { mode: "boolean" }).notNull().default(false),
 }, (table) => [uniqueIndex("week_type_day_intent_unique").on(table.weekTypeId, table.day)]);
 
 /** A programme-week-specific copy/override of a reusable Week Type intent. */
@@ -410,6 +414,7 @@ export const programmeWeekDayIntents = sqliteTable("programme_week_day_intents",
   category: text("category").notNull().default("hard"),
   workoutKind: text("workout_kind").notNull().default(""),
   details: text("details").notNull().default(""),
+  isQualityIntent: integer("is_quality_intent", { mode: "boolean" }).notNull().default(false),
 }, (table) => [uniqueIndex("programme_week_day_intent_unique").on(table.weekId, table.day)]);
 
 export const programmeWeekRecommendations = sqliteTable("programme_week_recommendations", {

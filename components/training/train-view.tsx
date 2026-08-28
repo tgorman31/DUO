@@ -37,6 +37,7 @@ import type {
   Mutate,
   Session,
   StrengthSlot,
+  StrengthDefinition,
 } from "@/lib/app-types";
 import { CategoryBadge, EmptyState, formatDay, SectionHeading } from "./common";
 import { exerciseAvailable, resolveSessionLocationId } from "@/lib/equipment";
@@ -227,67 +228,59 @@ function createExerciseDraft(data: AppData, slot: StrengthSlot, exerciseId = slo
   return { slotId: slot.id, exerciseId, workingLoad: load ? String(load) : "", sets: Array.from({ length: slot.workingSets }, () => ({ weightKg: load ? String(load) : "", reps: "" })), note: "" };
 }
 
+function v2DefinitionFor(data: AppData, session: Session, availableEquipment: string[]) {
+  const templateId = session.workout?.strengthTemplateId
+    ?? (session.workoutKind === "strength-a" ? "strength-template-a" : session.workoutKind === "strength-b" ? "strength-template-b" : null);
+  const template = templateId ? data.v2.strengthTemplates.find((item) => item.id === templateId) : null;
+  if (!template) return undefined;
+  return {
+    workoutKind: session.workoutKind,
+    label: session.workout?.name ?? template.name,
+    slots: template.slots.map((slot) => {
+      const focus = data.v2.trainingFocuses.find((item) => item.id === slot.focusId);
+      const toOption = (exercise: AppData["v2"]["catalogue"][number], unavailable = false): ExerciseOption => ({
+        slotId: slot.id,
+        exerciseId: exercise.id,
+        name: exercise.name,
+        baseName: exercise.name,
+        trainingGoal: focus?.name ?? "Training focus",
+        defaultIncrementKg: exercise.defaultIncrementKg ?? data.actor.loadIncrementKg ?? 2.5,
+        loadConvention: exercise.loadConvention as LoadConvention,
+        isAccessory: /accessory|curl|raise|calf|plank/i.test(focus?.name ?? ""),
+        hyroxCarryover: exercise.helpsWith,
+        unavailable,
+      });
+      const options = data.v2.catalogue
+        .filter((exercise) => exercise.trainingFocus === focus?.name && exerciseAvailable(exercise.primaryEquipment, exercise.secondaryEquipment, availableEquipment))
+        .sort((a, b) => a.focusRank - b.focusRank)
+        .map((exercise) => toOption(exercise));
+      const programmed = slot.exerciseId ? data.v2.catalogue.find((exercise) => exercise.id === slot.exerciseId) : null;
+      if (programmed && !options.some((option) => option.exerciseId === programmed.id)) options.unshift(toOption(programmed, true));
+      const selected = slot.exerciseId ?? options[0]?.exerciseId ?? "";
+      const prescription = slot.prescription || focus?.defaultPrescription || "3 × 8–10";
+      const numbers = prescription.match(/(\d+)\s*[×x]\s*(\d+)(?:\s*[–-]\s*(\d+))?/i);
+      return {
+        id: slot.id,
+        workoutKind: session.workoutKind,
+        sortOrder: slot.sortOrder,
+        trainingGoal: focus?.name ?? "Training focus",
+        defaultExerciseId: selected,
+        workingSets: numbers ? Number(numbers[1]) : 3,
+        repLow: numbers ? Number(numbers[2]) : 8,
+        repHigh: numbers ? Number(numbers[3] ?? numbers[2]) : 10,
+        selectedExerciseId: selected,
+        options,
+      };
+    }),
+  } satisfies StrengthDefinition;
+}
+
 function StrengthLogger({ data, session, route, mutate, onNavigate, onDone }: { data: AppData; session: Session; route: AppRoute; mutate: Mutate; onNavigate: Navigate; onDone: () => void }) {
   const resolvedLocationId = resolveSessionLocationId(session.locationId, data.v2.currentLocationId);
   const sessionLocation = data.v2.locations.find((location) => location.id === resolvedLocationId);
   const availableEquipment = sessionLocation?.equipment ?? [];
-  const definition = data.strengthDefinitions.find((item) => item.workoutKind === session.workoutKind) ?? (() => {
-    const template = session.workout?.strengthTemplateId
-      ? data.v2.strengthTemplates.find((item) => item.id === session.workout?.strengthTemplateId)
-      : null;
-    if (!template) return undefined;
-    return {
-      workoutKind: session.workoutKind,
-      label: session.workout?.name ?? template.name,
-      slots: template.slots.map((slot) => {
-        const focus = data.v2.trainingFocuses.find((item) => item.id === slot.focusId);
-        const options: ExerciseOption[] = data.v2.catalogue
-          .filter((exercise) => exercise.trainingFocus === focus?.name && exerciseAvailable(exercise.primaryEquipment, exercise.secondaryEquipment, availableEquipment))
-          .sort((a, b) => a.focusRank - b.focusRank)
-          .map((exercise) => ({
-            slotId: slot.id,
-            exerciseId: exercise.id,
-            name: exercise.name,
-            baseName: exercise.name,
-            trainingGoal: focus?.name ?? "Training focus",
-            defaultIncrementKg: exercise.defaultIncrementKg ?? data.actor.loadIncrementKg ?? 2.5,
-            loadConvention: exercise.loadConvention as LoadConvention,
-            isAccessory: /accessory|curl|raise|calf|plank/i.test(focus?.name ?? ""),
-            hyroxCarryover: exercise.helpsWith,
-          }));
-        const programmed = slot.exerciseId ? data.v2.catalogue.find((exercise) => exercise.id === slot.exerciseId) : null;
-        if (programmed && !options.some((option) => option.exerciseId === programmed.id)) {
-          options.unshift({
-            slotId: slot.id,
-            exerciseId: programmed.id,
-            name: programmed.name,
-            baseName: programmed.name,
-            trainingGoal: focus?.name ?? "Training focus",
-            defaultIncrementKg: programmed.defaultIncrementKg ?? data.actor.loadIncrementKg ?? 2.5,
-            loadConvention: programmed.loadConvention as LoadConvention,
-            isAccessory: false,
-            hyroxCarryover: programmed.helpsWith,
-            unavailable: true,
-          });
-        }
-        const selected = slot.exerciseId ?? options[0]?.exerciseId ?? "";
-        const prescription = slot.prescription || focus?.defaultPrescription || "3 × 8–10";
-        const numbers = prescription.match(/(\d+)\s*[×x]\s*(\d+)(?:\s*[–-]\s*(\d+))?/i);
-        return {
-          id: slot.id,
-          workoutKind: session.workoutKind,
-          sortOrder: slot.sortOrder,
-          trainingGoal: focus?.name ?? "Training focus",
-          defaultExerciseId: selected,
-          workingSets: numbers ? Number(numbers[1]) : 3,
-          repLow: numbers ? Number(numbers[2]) : 8,
-          repHigh: numbers ? Number(numbers[3] ?? numbers[2]) : 10,
-          selectedExerciseId: selected,
-          options,
-        };
-      }),
-    };
-  })();
+  const definition = v2DefinitionFor(data, session, availableEquipment)
+    ?? data.strengthDefinitions.find((item) => item.workoutKind === session.workoutKind);
   const initialIndex = Math.max(0, definition?.slots.findIndex((slot) => slot.id === route.exerciseId) ?? 0);
   const [index, setIndex] = useState(initialIndex);
   const [drafts, setDrafts] = useState<Record<string, ExerciseDraft>>(() => Object.fromEntries((definition?.slots ?? []).map((slot) => [slot.id, createExerciseDraft(data, slot)])));

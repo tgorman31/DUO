@@ -5,7 +5,7 @@ export function normaliseEquipment(value: string | null | undefined) {
     "wall balls": "wall ball", "heavy sandbag": "sandbag", "sand bags": "sandbag", "dumbbells": "dumbbell",
     "flat bench": "bench flat", "bench (flat)": "bench flat", "bench": "bench flat", "smith machine": "smith machine",
     "leg press": "leg press machine", "leg curl": "leg curl machine", "leg extension": "leg extension machine",
-    "battle rope": "sled", "battle ropes": "sled", "farmer carry handles": "farmer carry",
+    "farmer carry handles": "farmer carry",
   };
   return aliases[normalized] ?? normalized;
 }

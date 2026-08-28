@@ -8,7 +8,7 @@ import "tsx";
 import * as schema from "../db/schema.ts";
 
 const { ensureSeeded, resetTrainingData, LEGACY_SLOT_FOCUS_MAP, LEGACY_CATALOGUE_ALIAS_MAP } = await import("../db/seed.ts");
-const { reconcileV2RecommendedWeek } = await import("../db/week-planning.ts");
+const { reconcileV2RecommendedWeek, applyWeekTypeToProgrammeWeek } = await import("../db/week-planning.ts");
 const { completeStrengthEntries } = await import("../lib/strength-completion.ts");
 const { cloneStrengthTemplate } = await import("../lib/strength-template.ts");
 const { exerciseAvailable } = await import("../lib/equipment.ts");
@@ -220,8 +220,10 @@ test("Strength A clone service creates independent V2 and history identities", a
 test("equipment matching canonicalizes wall balls and HYROX sled pull setup", () => {
   assert.equal(exerciseAvailable("Wall Ball", "None", ["Wall Balls"]), true);
   assert.equal(exerciseAvailable("Sled", "None", ["Sled"]), true);
-  assert.equal(exerciseAvailable("Sled", "Battle Ropes", ["Sled"]), true);
-  assert.equal(exerciseAvailable("Sled", "Battle Ropes", []), false);
+  assert.equal(exerciseAvailable("Sled", "Sled Pull Rope", ["Sled", "Sled Pull Rope"]), true);
+  assert.equal(exerciseAvailable("Sled", "Sled Pull Rope", ["Sled"]), false);
+  assert.equal(exerciseAvailable("Battle Ropes", "None", ["Sled"]), false);
+  assert.equal(exerciseAvailable("Battle Ropes", "None", ["Battle Ropes"]), true);
   assert.equal(exerciseAvailable("Dumbbell", "Bench (Flat)", ["Dumbbell"]), false);
   assert.equal(exerciseAvailable("Dumbbell", "Bench (Flat)", ["Dumbbell", "Bench (Flat)"]), true);
 });
@@ -243,5 +245,122 @@ test("real strength completion persists catalogue history and failed replacement
     const before = await db.select().from(schema.exercisePerformances).where(eq(schema.exercisePerformances.resultId, resultId));
     await assert.rejects(() => completeStrengthEntries(db, { resultId, athleteId: "thomas", completedDate: session.scheduledDate, entries: [first, { slotId: "missing", exerciseId: catalogue.id, sets: [{ weightKg: 1, reps: 1 }] }] }));
     assert.deepEqual(await db.select().from(schema.exercisePerformances).where(eq(schema.exercisePerformances.resultId, resultId)), before);
+  } finally { await miniflare.dispose(); }
+});
+
+test("full Running Priority weeks keep progression on exactly the quality day", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    for (const [weekId, expectedQuality] of [["week-2026-09-21", "3 × 8 min"], ["week-2026-09-28", "8 × 2 min"]]) {
+      const [week] = await db.select().from(schema.plannedWeeks).where(eq(schema.plannedWeeks.id, weekId));
+      const intents = await db.select().from(schema.programmeWeekDayIntents).where(eq(schema.programmeWeekDayIntents.weekId, weekId));
+      assert.equal(intents.filter((intent) => intent.isQualityIntent && intent.progressionTrackId).length, 1);
+      const rows = await reconcileV2RecommendedWeek(db, week, intents, true, { sharedProgression: true });
+      const titles = rows.sort((a, b) => a.sortOrder - b.sortOrder).map((row) => row.title);
+      if (weekId === "week-2026-09-21") assert.deepEqual(titles.map((title) => title.toLowerCase()), ["tread and shred", "easy + strides", "strength a", "3 × 8 min", "strength b", "long easy run", "rest / recovery"]);
+      if (weekId === "week-2026-09-28") {
+        assert.equal(titles[0], "Tread and Shred");
+        assert.equal(titles[3], "8 × 2 min");
+      }
+      assert.equal(rows.find((row) => row.sortOrder === 0)?.title, "Tread and Shred");
+      assert.equal(rows.find((row) => row.sortOrder === 3)?.title, expectedQuality);
+      assert.equal(rows.filter((row) => row.title === expectedQuality).length, 1);
+    }
+  } finally { await miniflare.dispose(); }
+});
+
+test("legacy alias review keeps distinct V1 exercises on independent histories", () => {
+  assert.equal(LEGACY_CATALOGUE_ALIAS_MAP["db-press"], "duo-ex-033");
+  assert.equal(LEGACY_CATALOGUE_ALIAS_MAP["db-rdl"], "duo-ex-011");
+  assert.equal(LEGACY_CATALOGUE_ALIAS_MAP["db-shoulder-press"], "duo-ex-040");
+  assert.equal(LEGACY_CATALOGUE_ALIAS_MAP["db-pullover"], "duo-ex-056");
+  assert.equal(LEGACY_CATALOGUE_ALIAS_MAP["hack-squat"], undefined);
+  assert.equal(LEGACY_CATALOGUE_ALIAS_MAP["single-leg-rdl"], undefined);
+  assert.equal(LEGACY_CATALOGUE_ALIAS_MAP["suitcase-hold"], undefined);
+});
+
+test("Train gives V2 Strength A/B templates live-programming precedence", async () => {
+  const source = await readFile(new URL("../components/training/train-view.tsx", import.meta.url), "utf8");
+  const v2Index = source.indexOf("const definition = v2DefinitionFor(data, session");
+  const legacyIndex = source.indexOf("data.strengthDefinitions.find((item) => item.workoutKind === session.workoutKind)");
+  assert.ok(v2Index >= 0 && legacyIndex > v2Index);
+  assert.match(source, /session\.workoutKind === \"strength-a\" \? \"strength-template-a\"/);
+});
+
+test("applying a different Week Type replaces stale programme intents", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    const weekId = "week-2026-09-21";
+    const everlast = await applyWeekTypeToProgrammeWeek(db, weekId, "week-type-everlast");
+    assert.equal(everlast.find((intent) => intent.day === 5)?.intent, "Everlast sled session");
+    assert.equal(everlast.find((intent) => intent.day === 3)?.intent, "Easy + strides");
+    assert.equal(everlast.find((intent) => intent.day === 5)?.category, "hard");
+    const [week] = await db.select().from(schema.plannedWeeks).where(eq(schema.plannedWeeks.id, weekId));
+    const materialized = await reconcileV2RecommendedWeek(db, week, everlast, true, { sharedProgression: true });
+    assert.ok(materialized.some((row) => row.title.toLowerCase().includes("everlast")));
+    const back = await applyWeekTypeToProgrammeWeek(db, weekId, "week-type-running-priority");
+    assert.equal(back.find((intent) => intent.day === 0)?.intent, "Tread and Shred");
+    assert.equal(back.find((intent) => intent.day === 3)?.category, "hard");
+    assert.notEqual(back.find((intent) => intent.day === 6)?.category, "hard");
+  } finally { await miniflare.dispose(); }
+});
+
+test("materialized locations use explicit day context, not Building Gym blanket defaults", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    const [runningWeek] = await db.select().from(schema.plannedWeeks).where(eq(schema.plannedWeeks.id, "week-2026-09-21"));
+    const runningIntents = await db.select().from(schema.programmeWeekDayIntents).where(eq(schema.programmeWeekDayIntents.weekId, runningWeek.id));
+    const running = await reconcileV2RecommendedWeek(db, runningWeek, runningIntents, true, { defaultLocationId: null, sharedProgression: true });
+    assert.notEqual(running.find((row) => row.sortOrder === 0)?.locationId, "location-building-gym");
+    assert.equal(running.find((row) => row.sortOrder === 2)?.locationId, null);
+    assert.equal(running.find((row) => row.sortOrder === 3)?.locationId, null);
+    const [everlastWeek] = await db.select().from(schema.plannedWeeks).where(eq(schema.plannedWeeks.id, "week-2026-10-26"));
+    await applyWeekTypeToProgrammeWeek(db, everlastWeek.id, "week-type-everlast");
+    const everlastIntents = await db.select().from(schema.programmeWeekDayIntents).where(eq(schema.programmeWeekDayIntents.weekId, everlastWeek.id));
+    const everlast = await reconcileV2RecommendedWeek(db, everlastWeek, everlastIntents, true, { defaultLocationId: null, sharedProgression: true });
+    const everlastSession = everlast.find((row) => row.title.toLowerCase().includes("everlast"));
+    assert.equal(everlastSession?.locationId, "location-everlast");
+    assert.ok(everlast.filter((row) => row !== everlastSession && row.locationId === "location-everlast").length === 0);
+    const [dublinWeek] = await db.select().from(schema.plannedWeeks).where(eq(schema.plannedWeeks.id, "week-2026-11-09"));
+    const dublinIntents = await db.select().from(schema.programmeWeekDayIntents).where(eq(schema.programmeWeekDayIntents.weekId, dublinWeek.id));
+    const dublin = await reconcileV2RecommendedWeek(db, dublinWeek, dublinIntents, true, { defaultLocationId: null, sharedProgression: true });
+    assert.equal(dublin.find((row) => row.title === "HYROX Dublin")?.locationId, null);
+  } finally { await miniflare.dispose(); }
+});
+
+test("shared progression is deterministic regardless of the Set Week caller", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    await db.insert(schema.progressionStatesV2).values([
+      { athleteId: "thomas", trackId: "track-lt2-running", currentStep: 2, togetherPending: false, updatedAt: new Date().toISOString() },
+      { athleteId: "kt", trackId: "track-lt2-running", currentStep: 1, togetherPending: false, updatedAt: new Date().toISOString() },
+    ]).onConflictDoUpdate({ target: [schema.progressionStatesV2.athleteId, schema.progressionStatesV2.trackId], set: { currentStep: 2, updatedAt: new Date().toISOString() } });
+    await db.update(schema.progressionStatesV2).set({ currentStep: 1 }).where(eq(schema.progressionStatesV2.athleteId, "kt"));
+    const [week] = await db.select().from(schema.plannedWeeks).where(eq(schema.plannedWeeks.id, "week-2026-09-21"));
+    const [intent] = await db.select().from(schema.programmeWeekDayIntents).where(eq(schema.programmeWeekDayIntents.weekId, week.id)).where(eq(schema.programmeWeekDayIntents.day, 3));
+    const asThomas = await reconcileV2RecommendedWeek(db, week, [{ ...intent, progressionTrackId: "track-lt2-running" }], true, { athleteId: "thomas", sharedProgression: true });
+    const asKt = await reconcileV2RecommendedWeek(db, week, [{ ...intent, progressionTrackId: "track-lt2-running" }], true, { athleteId: "kt", sharedProgression: true });
+    assert.equal(asThomas[0].title, "3 × 10 min");
+    assert.equal(asKt[0].title, asThomas[0].title);
+  } finally { await miniflare.dispose(); }
+});
+
+test("catalogue-only completion uses catalogue compatibility history IDs through the real service", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    const [catalogue] = await db.select().from(schema.catalogueExercises).where(sql`legacy_exercise_id is null`).limit(1);
+    assert.ok(catalogue);
+    const historyId = `catalogue-${catalogue.id}`;
+    const [session] = await db.select().from(schema.athleteSessions).where(eq(schema.athleteSessions.athleteId, "thomas")).limit(1);
+    const resultId = "result-catalogue-service";
+    await db.insert(schema.workoutResults).values({ id: resultId, sessionId: session.id, athleteId: "thomas", completedDate: session.scheduledDate, rpe: 7, feel: 8, averagePace: "", totalTime: "", notes: "" });
+    await completeStrengthEntries(db, { resultId, athleteId: "thomas", completedDate: session.scheduledDate, entries: [{ slotId: "a-knee", exerciseId: catalogue.id, sets: [{ weightKg: 42, reps: 7 }, { weightKg: 42, reps: 7 }, { weightKg: 42, reps: 7 }] }] });
+    const [performance] = await db.select().from(schema.exercisePerformances).where(eq(schema.exercisePerformances.resultId, resultId));
+    assert.equal(performance.exerciseId, historyId);
+    assert.equal((await db.select().from(schema.strengthSets)).filter((row) => row.performanceId === performance.id).length, 3);
+    const [state] = await db.select().from(schema.progressionStates).where(eq(schema.progressionStates.athleteId, "thomas")).where(eq(schema.progressionStates.exerciseId, historyId));
+    assert.ok(state);
+    const [history] = await db.select().from(schema.exercisePerformances).where(eq(schema.exercisePerformances.exerciseId, historyId));
+    assert.equal(history.workingLoadKg, 42);
   } finally { await miniflare.dispose(); }
 });

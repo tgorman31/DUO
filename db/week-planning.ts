@@ -1,6 +1,6 @@
 import { eq } from "drizzle-orm";
 import type { TrainingDb } from "./seed";
-import { athleteSessions, plannedWeeks, sharedSessions, strengthTemplates, weekTypeDayIntents, workoutLibraryItems, progressionTracks, progressionSteps, progressionStatesV2 } from "./schema";
+import { athleteSessions, plannedWeeks, sharedSessions, strengthTemplates, weekTypeDayIntents, programmeWeekDayIntents, workoutLibraryItems, progressionTracks, progressionSteps, progressionStatesV2 } from "./schema";
 import {
   addDays,
   scheduleForWeek,
@@ -14,6 +14,51 @@ type WeekPlanBasis = {
   weekType: string;
   qualityFocus: string;
 };
+
+type ProgrammeIntent = {
+  id: string;
+  weekId?: string;
+  day: number;
+  intent: string;
+  workoutId: string | null;
+  strengthTemplateId: string | null;
+  progressionTrackId: string | null;
+  locationId: string | null;
+  priorityEmphasis: string;
+  category?: string;
+  workoutKind?: string;
+  details?: string;
+  isQualityIntent?: boolean;
+};
+
+/** Rebuild one unset programme week's recommendation from a reusable Week
+ * Type. Explicit single-week changes intentionally replace stale intents. */
+export async function applyWeekTypeToProgrammeWeek(db: TrainingDb, weekId: string, weekTypeId: string) {
+  const [week] = await db.select({ confirmedAt: plannedWeeks.confirmedAt }).from(plannedWeeks).where(eq(plannedWeeks.id, weekId)).limit(1);
+  if (!week) throw new Error("Programme week not found.");
+  if (week.confirmedAt) throw new Error("Set programme weeks cannot be replaced.");
+  const templateIntents = await db.select().from(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, weekTypeId));
+  await db.delete(programmeWeekDayIntents).where(eq(programmeWeekDayIntents.weekId, weekId));
+  const copied = templateIntents.map((intent) => ({
+    id: `programme-intent-${weekId}-${intent.day}`,
+    weekId,
+    day: intent.day,
+    intent: intent.intent,
+    workoutId: intent.workoutId,
+    strengthTemplateId: intent.strengthTemplateId,
+    progressionTrackId: intent.progressionTrackId,
+    locationId: intent.locationId,
+    priorityEmphasis: intent.priorityEmphasis,
+    category: intent.category,
+    workoutKind: intent.workoutKind,
+    details: intent.details,
+    isQualityIntent: intent.isQualityIntent,
+  }));
+  for (let index = 0; index < copied.length; index += 20) {
+    await db.insert(programmeWeekDayIntents).values(copied.slice(index, index + 20));
+  }
+  return copied;
+}
 
 const ATHLETE_IDS = ["thomas", "kt"] as const;
 
@@ -121,9 +166,9 @@ export async function reconcileRecommendedWeek(
 export async function reconcileV2RecommendedWeek(
   db: TrainingDb,
   week: WeekPlanBasis,
-  intents: Array<typeof weekTypeDayIntents.$inferSelect | { id: string; weekId: string; day: number; intent: string; workoutId: string | null; strengthTemplateId: string | null; progressionTrackId: string | null; locationId: string | null; priorityEmphasis: string; category?: string; workoutKind?: string; details?: string }>,
+  intents: Array<ProgrammeIntent>,
   activate: boolean,
-  options: { defaultLocationId?: string | null; athleteId?: string } = {},
+  options: { defaultLocationId?: string | null; athleteId?: string; sharedProgression?: boolean } = {},
 ) {
   const now = new Date().toISOString();
   const currentAthleteRows = await db.select().from(athleteSessions).where(eq(athleteSessions.weekId, week.id));
@@ -145,9 +190,12 @@ export async function reconcileV2RecommendedWeek(
     if (intent.progressionTrackId) {
       const [track] = await db.select().from(progressionTracks).where(eq(progressionTracks.id, intent.progressionTrackId)).limit(1);
       if (track) {
-        const state = options.athleteId
-          ? await db.select().from(progressionStatesV2).where(eq(progressionStatesV2.trackId, track.id)).limit(10).then((rows) => rows.find((row) => row.athleteId === options.athleteId))
-          : null;
+        const states = await db.select().from(progressionStatesV2).where(eq(progressionStatesV2.trackId, track.id)).limit(10);
+        const state = options.sharedProgression
+          ? states.sort((a, b) => a.currentStep - b.currentStep)[0]
+          : options.athleteId
+            ? states.find((row) => row.athleteId === options.athleteId)
+            : undefined;
         const steps = await db.select().from(progressionSteps).where(eq(progressionSteps.trackId, track.id)).orderBy(progressionSteps.sortOrder);
         const step = steps[Math.min(state?.currentStep ?? 0, Math.max(steps.length - 1, 0))];
         if (step) {

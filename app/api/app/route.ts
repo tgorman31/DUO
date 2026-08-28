@@ -13,6 +13,7 @@ import { ensureSeeded, rebuildWeekSessions, resetTrainingData, type TrainingDb }
 import {
   reconcileRecommendedWeek,
   reconcileV2RecommendedWeek,
+  applyWeekTypeToProgrammeWeek,
   unsetWeekPlanningState,
 } from "@/db/week-planning";
 import {
@@ -942,12 +943,15 @@ export async function POST(request: Request) {
         : recommendation?.weekTypeId
           ? await db.select().from(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, recommendation.weekTypeId)).orderBy(asc(weekTypeDayIntents.day))
           : [];
+      // The programme recommendation owns one explicitly marked quality
+      // intent. Materialisation must not reinterpret every hard session as
+      // the same running progression.
       const intents = recommendation?.progressionTrackId
-        ? baseIntents.map((intent) => (intent as { category?: string }).category === "hard" && !intent.strengthTemplateId ? { ...intent, progressionTrackId: recommendation.progressionTrackId } : intent)
+        ? baseIntents.map((intent) => (intent as { isQualityIntent?: boolean }).isQualityIntent ? { ...intent, progressionTrackId: recommendation.progressionTrackId } : intent)
         : baseIntents;
       const weekType = recommendation?.weekTypeId ? await db.select().from(weekTypeTemplates).where(eq(weekTypeTemplates.id, recommendation.weekTypeId)).limit(1).then((rows) => rows[0]) : null;
       const materializedSessions = recommendation?.weekTypeId && intents.length
-        ? await reconcileV2RecommendedWeek(db, week, intents, true, { defaultLocationId: weekType?.defaultLocationId ?? null, athleteId: actor.id })
+        ? await reconcileV2RecommendedWeek(db, week, intents, true, { defaultLocationId: weekType?.defaultLocationId ?? null, sharedProgression: true })
         : await reconcileRecommendedWeek(db, week, true);
       const confirmedAt = nowIso();
       await db
@@ -995,11 +999,7 @@ export async function POST(request: Request) {
       await rebuildWeekSessions(db, updated);
       if (v2Template) {
         await db.insert(programmeWeekRecommendations).values({ id: `programme-recommendation-${weekId}`, weekId, weekTypeId: v2Template.id, phaseId: null, progressionTrackId: null, title: v2Template.name, rationale: v2Template.rationale, qualityIntent: "", updatedAt: nowIso() }).onConflictDoUpdate({ target: programmeWeekRecommendations.weekId, set: { weekTypeId: v2Template.id, title: v2Template.name, rationale: v2Template.rationale, updatedAt: nowIso() } });
-        const existingProgrammeIntents = await db.select({ id: programmeWeekDayIntents.id }).from(programmeWeekDayIntents).where(eq(programmeWeekDayIntents.weekId, weekId));
-        if (!existingProgrammeIntents.length) {
-          const templateIntents = await db.select().from(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, v2Template.id));
-          for (const batch of d1InsertBatches(templateIntents.map((intent) => ({ id: `programme-intent-${weekId}-${intent.day}`, weekId, day: intent.day, intent: intent.intent, workoutId: intent.workoutId, strengthTemplateId: intent.strengthTemplateId, progressionTrackId: intent.progressionTrackId, locationId: intent.locationId, priorityEmphasis: intent.priorityEmphasis, category: "hard", workoutKind: "", details: intent.intent })))) await db.insert(programmeWeekDayIntents).values(batch).onConflictDoNothing();
-        }
+        await applyWeekTypeToProgrammeWeek(db, weekId, v2Template.id);
       }
       await createActivity(db, actor.id, "plan", `${actor.displayName} selected ${info.label}.`, weekId);
       return Response.json({ ok: true });

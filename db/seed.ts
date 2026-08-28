@@ -67,11 +67,11 @@ import {
 
 /** Reviewed, deterministic V1 exercise identities -> curated V2 catalogue IDs. */
 export const LEGACY_CATALOGUE_ALIAS_MAP: Record<string, string> = {
-  "smith-squat": "duo-ex-001", "leg-press": "duo-ex-002", "hack-squat": "duo-ex-001", "goblet-squat": "duo-ex-003",
+  "smith-squat": "duo-ex-001", "leg-press": "duo-ex-002", "goblet-squat": "duo-ex-003",
   "db-press": "duo-ex-033", "machine-chest-press": "duo-ex-032", "lat-pulldown": "duo-ex-051", "pull-up": "duo-ex-053",
   "single-leg-press": "duo-ex-017", "bulgarian-split-squat": "duo-ex-018", "step-up": "duo-ex-021", "reverse-lunge": "duo-ex-019", "walking-lunge": "duo-ex-020",
-  "leg-curl": "duo-ex-025", "rdl": "duo-ex-012", "smith-rdl": "duo-ex-010", "db-rdl": "duo-ex-011", "single-leg-rdl": "duo-ex-011",
-  "calf-raise": "duo-ex-065", "standing-calf-raise": "duo-ex-065", "seated-calf-raise": "duo-ex-066", "farmer-carry": "duo-ex-058", "suitcase-hold": "duo-ex-061", "suitcase-carry": "duo-ex-060", "dead-hang": "duo-ex-062",
+  "leg-curl": "duo-ex-025", "rdl": "duo-ex-012", "smith-rdl": "duo-ex-010", "db-rdl": "duo-ex-011",
+  "calf-raise": "duo-ex-065", "seated-calf-raise": "duo-ex-066", "farmer-carry": "duo-ex-058", "suitcase-carry": "duo-ex-060", "dead-hang": "duo-ex-062",
   "machine-row": "duo-ex-044", "cable-row": "duo-ex-048", "chest-supported-row": "duo-ex-046", "db-row": "duo-ex-045", "db-shoulder-press": "duo-ex-040", "machine-shoulder-press": "duo-ex-039",
   "leg-extension": "duo-ex-084", "db-pullover": "duo-ex-056", "straight-arm-pulldown": "duo-ex-057", "weighted-plank": "duo-ex-077", "side-plank": "duo-ex-072",
 };
@@ -235,7 +235,7 @@ async function ensureV2Data(db: TrainingDb) {
     focusRank: exercise.focusRank,
     difficulty: exercise.difficulty,
     primaryEquipment: exercise.primaryEquipment,
-    secondaryEquipment: exercise.secondaryEquipment ?? "",
+    secondaryEquipment: exercise.id === "duo-ex-049" ? "Sled Pull Rope" : exercise.secondaryEquipment ?? "",
     bodyRegion: exercise.bodyRegion,
     movementPattern: exercise.movementPattern,
     mechanics: exercise.mechanics,
@@ -256,6 +256,7 @@ async function ensureV2Data(db: TrainingDb) {
     updatedAt: now,
   }));
   for (const batch of d1InsertBatches(catalogueRows)) await db.insert(catalogueExercises).values(batch).onConflictDoNothing();
+  await db.update(catalogueExercises).set({ secondaryEquipment: "Sled Pull Rope", updatedAt: now }).where(eq(catalogueExercises.id, "duo-ex-049"));
 
   // Every V2 exercise receives a stable history-compatible legacy row. Exact
   // aliases reuse the existing V1 id; new catalogue exercises use a namespaced
@@ -308,7 +309,7 @@ async function ensureV2Data(db: TrainingDb) {
   const inventories: Record<string, string[]> = {
     "location-building-gym": ["Smith Machine", "Leg Press Machine", "Leg Curl Machine", "Leg Extension Machine", "Dumbbell", "Barbell", "Bench (Flat)", "Cable", "Treadmill", "Bodyweight"],
     "location-perpetua": ["Treadmill", "Dumbbell", "Barbell", "Bench (Flat)", "SkiErg", "RowErg", "Bodyweight"],
-    "location-everlast": ["Smith Machine", "Leg Press Machine", "Leg Curl Machine", "Leg Extension Machine", "Dumbbell", "Barbell", "Bench (Flat)", "Cable", "Treadmill", "SkiErg", "RowErg", "Sled", "Wall Balls", "Sandbag", "Farmer Carry Handles", "Bodyweight"],
+    "location-everlast": ["Smith Machine", "Leg Press Machine", "Leg Curl Machine", "Leg Extension Machine", "Dumbbell", "Barbell", "Bench (Flat)", "Cable", "Treadmill", "SkiErg", "RowErg", "Sled", "Sled Pull Rope", "Wall Balls", "Sandbag", "Farmer Carry Handles", "Bodyweight"],
   };
   const equipmentRows = Object.entries(inventories).flatMap(([locationId, items]) => items.map((equipment) => ({ locationId, equipment })));
   for (const batch of d1InsertBatches(equipmentRows)) await db.insert(locationEquipment).values(batch).onConflictDoNothing();
@@ -368,9 +369,12 @@ async function ensureV2Data(db: TrainingDb) {
   }
 
   const weekTypeRows = Object.entries(WEEK_TYPE_INFO).map(([id, info]) => ({
-    id: `week-type-${id}`, teamId: TEAM_ID, name: info.label, rationale: info.rationale, hardTarget: info.targets.hard, strengthTarget: info.targets.strength, easyTarget: info.targets.easy, defaultLocationId: "location-building-gym", priorityEmphasis: "balanced", isBuiltIn: true, active: true, baseJson: JSON.stringify(info), updatedAt: now,
+    id: `week-type-${id}`, teamId: TEAM_ID, name: info.label, rationale: info.rationale, hardTarget: info.targets.hard, strengthTarget: info.targets.strength, easyTarget: info.targets.easy, defaultLocationId: null, priorityEmphasis: "balanced", isBuiltIn: true, active: true, baseJson: JSON.stringify(info), updatedAt: now,
   }));
   for (const batch of d1InsertBatches(weekTypeRows)) await db.insert(weekTypeTemplates).values(batch).onConflictDoNothing();
+  for (const template of weekTypeRows) {
+    await db.update(weekTypeTemplates).set({ defaultLocationId: template.defaultLocationId, updatedAt: now }).where(eq(weekTypeTemplates.id, template.id));
+  }
   const dayIntents = weekTypeRows.flatMap((weekType) => {
     const key = weekType.id.replace("week-type-", "");
     const schedule = scheduleForWeek({ id: `template-${key}`, weekType: key, qualityFocus: "" });
@@ -383,9 +387,20 @@ async function ensureV2Data(db: TrainingDb) {
       strengthTemplateId: item.workoutKind === "strength-a" ? "strength-template-a" : item.workoutKind === "strength-b" ? "strength-template-b" : null,
       progressionTrackId: item.title.toLowerCase().includes("lt2") ? "track-lt2-running" : item.title.toLowerCase().includes("vo") ? "track-vo2-running" : item.title.toLowerCase().includes("compromised") ? "track-hyrox-compromised" : null,
       priorityEmphasis: "balanced",
+      category: item.category,
+      workoutKind: item.workoutKind,
+      details: item.details,
+      isQualityIntent: item.workoutKind === "run-quality" || (item.workoutKind === "hyrox" && item.day === 5),
+      locationId: /tread and shred/i.test(item.title) || /perpetua hyrox/i.test(item.title) ? "location-perpetua" : /everlast sled/i.test(item.title) ? "location-everlast" : null,
     }))
   });
   for (const batch of d1InsertBatches(dayIntents)) await db.insert(weekTypeDayIntents).values(batch).onConflictDoNothing();
+  // Backfill the additive intent semantics on databases that already had V2
+  // rows before 0008. This only updates reusable template metadata and the
+  // explicit quality/location markers; it does not touch sessions or history.
+  for (const intent of dayIntents) {
+    await db.update(weekTypeDayIntents).set({ category: intent.category, workoutKind: intent.workoutKind, details: intent.details, isQualityIntent: intent.isQualityIntent, locationId: intent.locationId }).where(eq(weekTypeDayIntents.id, intent.id));
+  }
   const weeks = await db.select().from(plannedWeeks);
   const phases = await db.select().from(trainingPhases);
   const recommendations = weeks.map((week) => {
@@ -401,10 +416,11 @@ async function ensureV2Data(db: TrainingDb) {
     const schedule = scheduleForWeek(week);
     return schedule.map((item) => {
       const quality = `${week.qualityFocus} ${item.title}`.toLowerCase();
-      const progressionTrackId = item.category === "hard" && quality.includes("lt2") ? "track-lt2-running"
-        : item.category === "hard" && quality.includes("vo") ? "track-vo2-running"
-        : item.category === "hard" && (quality.includes("compromised") || quality.includes("hyrox-specific")) ? "track-hyrox-compromised"
-        : item.category === "hard" && quality.includes("threshold") ? "track-hyrox-threshold" : null;
+      const isQualityIntent = item.workoutKind === "run-quality" || (item.workoutKind === "hyrox" && item.day === 5);
+      const progressionTrackId = isQualityIntent && quality.includes("lt2") ? "track-lt2-running"
+        : isQualityIntent && quality.includes("vo") ? "track-vo2-running"
+        : isQualityIntent && (quality.includes("compromised") || quality.includes("hyrox-specific")) ? "track-hyrox-compromised"
+        : isQualityIntent && quality.includes("threshold") ? "track-hyrox-threshold" : null;
       return {
         id: `programme-intent-${week.id}-${item.day}`,
         weekId: week.id,
@@ -413,15 +429,19 @@ async function ensureV2Data(db: TrainingDb) {
         workoutId: workoutTemplateIdForSession(item.title, item.workoutKind),
         strengthTemplateId: item.workoutKind === "strength-a" ? "strength-template-a" : item.workoutKind === "strength-b" ? "strength-template-b" : null,
         progressionTrackId,
-        locationId: null,
+        locationId: /tread and shred/i.test(item.title) || /perpetua hyrox/i.test(item.title) ? "location-perpetua" : /everlast sled/i.test(item.title) ? "location-everlast" : null,
         priorityEmphasis: "balanced",
         category: item.category,
         workoutKind: item.workoutKind,
         details: item.details,
+        isQualityIntent,
       };
     });
   });
   for (const batch of d1InsertBatches(programmeIntents)) await db.insert(programmeWeekDayIntents).values(batch).onConflictDoNothing();
+  for (const intent of programmeIntents) {
+    await db.update(programmeWeekDayIntents).set({ isQualityIntent: intent.isQualityIntent, locationId: intent.locationId }).where(eq(programmeWeekDayIntents.id, intent.id));
+  }
 }
 
 export async function ensureSeeded(db: TrainingDb) {
@@ -436,13 +456,13 @@ export async function ensureSeeded(db: TrainingDb) {
       .from(appMetadata)
       .where(eq(appMetadata.key, "data-version"))
       .limit(1);
-    if (!versionMarker || versionMarker.value !== "2.0") {
+    if (!versionMarker || versionMarker.value !== "2.1") {
       await ensureV11Data(db);
       await ensureV2Data(db);
       await db
         .insert(appMetadata)
-        .values({ key: "data-version", value: "2.0", updatedAt: new Date().toISOString() })
-        .onConflictDoUpdate({ target: appMetadata.key, set: { value: "2.0", updatedAt: new Date().toISOString() } });
+        .values({ key: "data-version", value: "2.1", updatedAt: new Date().toISOString() })
+        .onConflictDoUpdate({ target: appMetadata.key, set: { value: "2.1", updatedAt: new Date().toISOString() } });
     } else {
       // 0007 is additive; an existing V2 database may have the marker but no
       // programme-week intent rows yet. Backfill only when the new layer is
