@@ -209,6 +209,8 @@ export type LibraryItem = {
   favourite: boolean;
   isRecent: boolean;
   canEdit: boolean;
+  strengthTemplateId: string | null;
+  priorityEmphasis: string;
 };
 
 export type PlanHistoryItem = {
@@ -274,6 +276,115 @@ export type WeekTypeInfo = {
   targets: { hard: number; strength: number; easy: number };
 };
 
+export type V2TrainingFocus = {
+  id: string;
+  name: string;
+  purpose: string;
+  defaultPrescription: string;
+  primaryMuscles: string;
+  hyroxLinks: string[];
+  programmingNotes: string;
+  isBuiltIn: boolean;
+  active: boolean;
+};
+
+export type V2CatalogueExercise = {
+  id: string;
+  name: string;
+  family: string;
+  trainingFocus: string;
+  secondaryFocus: string | null;
+  tier: string;
+  defaultVisibility: string;
+  focusRank: number;
+  primaryEquipment: string;
+  secondaryEquipment: string;
+  primaryMuscleGroup: string;
+  secondaryMuscleGroups: string;
+  helpsWith: string[];
+  directHyrox: boolean;
+  prescription: string;
+  loadConvention: string;
+  defaultIncrementKg: number | null;
+  demoUrl: string | null;
+  explanationUrl: string | null;
+  legacyExerciseId: string | null;
+};
+
+export type TrainingLocation = {
+  id: string;
+  name: string;
+  notes: string;
+  equipment: string[];
+  active: boolean;
+};
+
+export type StrengthBuilderSlot = {
+  id: string;
+  templateId: string;
+  focusId: string;
+  focusName: string;
+  exerciseId: string | null;
+  exerciseName: string | null;
+  prescription: string;
+  sortOrder: number;
+  notes: string;
+};
+
+export type StrengthBuilderTemplate = {
+  id: string;
+  name: string;
+  purpose: string;
+  isBuiltIn: boolean;
+  slots: StrengthBuilderSlot[];
+};
+
+export type ProgressionTrack = {
+  id: string;
+  name: string;
+  purpose: string;
+  isBuiltIn: boolean;
+  currentStep: number;
+  togetherPending: boolean;
+  steps: Array<{ id: string; title: string; prescription: string; workoutId: string | null; sortOrder: number }>;
+};
+
+export type WeekTypeTemplate = {
+  id: string;
+  name: string;
+  rationale: string;
+  hardTarget: number;
+  strengthTarget: number;
+  easyTarget: number;
+  defaultLocationId: string | null;
+  priorityEmphasis: string;
+  isBuiltIn: boolean;
+  intents: Array<{ id: string; day: number; intent: string; workoutId: string | null; strengthTemplateId: string | null; progressionTrackId: string | null; locationId: string | null; priorityEmphasis: string }>;
+};
+
+export type ProgrammeRecommendation = {
+  id: string;
+  weekId: string;
+  phaseId: string | null;
+  weekTypeId: string | null;
+  progressionTrackId: string | null;
+  title: string;
+  rationale: string;
+  qualityIntent: string;
+};
+
+export type V2Data = {
+  trainingFocuses: V2TrainingFocus[];
+  catalogue: V2CatalogueExercise[];
+  locations: TrainingLocation[];
+  currentLocationId: string | null;
+  priorities: Record<string, string[]>;
+  strengthTemplates: StrengthBuilderTemplate[];
+  progressionTracks: ProgressionTrack[];
+  weekTypeTemplates: WeekTypeTemplate[];
+  programmeRecommendations: ProgrammeRecommendation[];
+};
+
 export type AppData = {
   needsProfileClaim: false;
   actor: AthleteSummary;
@@ -317,6 +428,7 @@ export type AppData = {
   weekTypes: Record<string, WeekTypeInfo>;
   serverDate: string;
   coachAvailable: boolean;
+  v2: V2Data;
 };
 
 export type ClaimData = {

@@ -106,6 +106,9 @@ export const plannedWeeks = sqliteTable(
     easyTarget: integer("easy_target").notNull().default(2),
     confirmedAt: text("confirmed_at"),
     status: text("status").notNull().default("planned"),
+    programmeWeekTypeId: text("programme_week_type_id"),
+    programmePhaseId: text("programme_phase_id"),
+    programmeSnapshotJson: text("programme_snapshot_json").notNull().default("{}"),
     createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
     updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   },
@@ -213,7 +216,193 @@ export const exercises = sqliteTable("exercises", {
   loadConvention: text("load_convention").notNull().default("total_load"),
   isAccessory: integer("is_accessory", { mode: "boolean" }).notNull().default(false),
   hyroxCarryoverJson: text("hyrox_carryover_json").notNull().default("[]"),
+  catalogueId: text("catalogue_id"),
 });
+
+/** V2's opinionated catalogue is kept separate from the legacy exercise table.
+ * Existing strength history continues to reference `exercises`; catalogue
+ * rows link back through catalogueId when a deterministic alias exists. */
+export const trainingFocuses = sqliteTable("training_focuses", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  purpose: text("purpose").notNull().default(""),
+  defaultPrescription: text("default_prescription").notNull().default(""),
+  primaryMuscles: text("primary_muscles").notNull().default(""),
+  sourcePatterns: text("source_patterns").notNull().default(""),
+  hyroxLinksJson: text("hyrox_links_json").notNull().default("[]"),
+  programmingNotes: text("programming_notes").notNull().default(""),
+  isBuiltIn: integer("is_built_in", { mode: "boolean" }).notNull().default(true),
+  active: integer("active", { mode: "boolean" }).notNull().default(true),
+  baseJson: text("base_json").notNull().default("{}"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+});
+
+export const catalogueExercises = sqliteTable("catalogue_exercises", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  sourceType: text("source_type").notNull().default("Source database"),
+  sourceRow: integer("source_row"),
+  family: text("family").notNull().default(""),
+  trainingFocus: text("training_focus").notNull(),
+  secondaryFocus: text("secondary_focus"),
+  tier: text("tier").notNull().default("Useful"),
+  defaultVisibility: text("default_visibility").notNull().default("More options"),
+  focusRank: integer("focus_rank").notNull().default(99),
+  difficulty: text("difficulty").notNull().default(""),
+  primaryEquipment: text("primary_equipment").notNull().default(""),
+  secondaryEquipment: text("secondary_equipment").notNull().default(""),
+  bodyRegion: text("body_region").notNull().default(""),
+  movementPattern: text("movement_pattern").notNull().default(""),
+  mechanics: text("mechanics").notNull().default(""),
+  laterality: text("laterality").notNull().default(""),
+  primaryMuscleGroup: text("primary_muscle_group").notNull().default(""),
+  secondaryMuscleGroups: text("secondary_muscle_groups").notNull().default(""),
+  helpsWithJson: text("helps_with_json").notNull().default("[]"),
+  directHyrox: integer("direct_hyrox", { mode: "boolean" }).notNull().default(false),
+  prescription: text("prescription").notNull().default(""),
+  loadConvention: text("load_convention").notNull().default("total_load"),
+  defaultIncrementKg: real("default_increment_kg"),
+  demoUrl: text("demo_url"),
+  explanationUrl: text("explanation_url"),
+  whyDuoKeeps: text("why_duo_keeps").notNull().default(""),
+  legacyExerciseId: text("legacy_exercise_id"),
+  isBuiltIn: integer("is_built_in", { mode: "boolean" }).notNull().default(true),
+  active: integer("active", { mode: "boolean" }).notNull().default(true),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [index("catalogue_exercises_focus_idx").on(table.trainingFocus), index("catalogue_exercises_tier_idx").on(table.tier)]);
+
+export const exerciseFocusLinks = sqliteTable("exercise_focus_links", {
+  exerciseId: text("exercise_id").notNull().references(() => catalogueExercises.id),
+  focusId: text("focus_id").notNull().references(() => trainingFocuses.id),
+  relationship: text("relationship").notNull().default("primary"),
+}, (table) => [primaryKey({ columns: [table.exerciseId, table.focusId] })]);
+
+export const focusHyroxRelationships = sqliteTable("focus_hyrox_relationships", {
+  focusId: text("focus_id").notNull().references(() => trainingFocuses.id),
+  station: text("station").notNull(),
+  score: integer("score").notNull().default(0),
+}, (table) => [primaryKey({ columns: [table.focusId, table.station] }), index("focus_hyrox_station_idx").on(table.station)]);
+
+export const trainingLocations = sqliteTable("training_locations", {
+  id: text("id").primaryKey(),
+  teamId: text("team_id").notNull().references(() => trainingTeams.id),
+  name: text("name").notNull(),
+  notes: text("notes").notNull().default(""),
+  active: integer("active", { mode: "boolean" }).notNull().default(true),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [index("training_locations_team_idx").on(table.teamId)]);
+
+export const locationEquipment = sqliteTable("location_equipment", {
+  locationId: text("location_id").notNull().references(() => trainingLocations.id),
+  equipment: text("equipment").notNull(),
+}, (table) => [primaryKey({ columns: [table.locationId, table.equipment] })]);
+
+export const athleteCurrentLocations = sqliteTable("athlete_current_locations", {
+  athleteId: text("athlete_id").primaryKey().references(() => athletes.id),
+  locationId: text("location_id").notNull().references(() => trainingLocations.id),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+});
+
+export const athleteHyroxPriorities = sqliteTable("athlete_hyrox_priorities", {
+  athleteId: text("athlete_id").notNull().references(() => athletes.id),
+  rank: integer("rank").notNull(),
+  station: text("station").notNull(),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [primaryKey({ columns: [table.athleteId, table.rank] }), uniqueIndex("athlete_hyrox_station_unique").on(table.athleteId, table.station)]);
+
+export const strengthTemplates = sqliteTable("strength_templates", {
+  id: text("id").primaryKey(),
+  teamId: text("team_id").notNull().references(() => trainingTeams.id),
+  name: text("name").notNull(),
+  purpose: text("purpose").notNull().default(""),
+  isBuiltIn: integer("is_built_in", { mode: "boolean" }).notNull().default(false),
+  baseTemplateId: text("base_template_id"),
+  active: integer("active", { mode: "boolean" }).notNull().default(true),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [index("strength_templates_team_idx").on(table.teamId)]);
+
+export const strengthFocusSlots = sqliteTable("strength_focus_slots", {
+  id: text("id").primaryKey(),
+  templateId: text("template_id").notNull().references(() => strengthTemplates.id),
+  focusId: text("focus_id").notNull().references(() => trainingFocuses.id),
+  exerciseId: text("exercise_id").references(() => catalogueExercises.id),
+  prescription: text("prescription").notNull().default(""),
+  sortOrder: integer("sort_order").notNull().default(0),
+  notes: text("notes").notNull().default(""),
+}, (table) => [index("strength_focus_slots_template_idx").on(table.templateId, table.sortOrder)]);
+
+export const progressionTracks = sqliteTable("progression_tracks", {
+  id: text("id").primaryKey(),
+  teamId: text("team_id").notNull().references(() => trainingTeams.id),
+  name: text("name").notNull(),
+  purpose: text("purpose").notNull().default(""),
+  isBuiltIn: integer("is_built_in", { mode: "boolean" }).notNull().default(false),
+  active: integer("active", { mode: "boolean" }).notNull().default(true),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+});
+
+export const progressionSteps = sqliteTable("progression_steps", {
+  id: text("id").primaryKey(),
+  trackId: text("track_id").notNull().references(() => progressionTracks.id),
+  workoutId: text("workout_id").references(() => workoutLibraryItems.id),
+  title: text("title").notNull(),
+  prescription: text("prescription").notNull().default(""),
+  sortOrder: integer("sort_order").notNull().default(0),
+}, (table) => [index("progression_steps_track_idx").on(table.trackId, table.sortOrder)]);
+
+export const progressionStatesV2 = sqliteTable("progression_states_v2", {
+  athleteId: text("athlete_id").notNull().references(() => athletes.id),
+  trackId: text("track_id").notNull().references(() => progressionTracks.id),
+  currentStep: integer("current_step").notNull().default(0),
+  togetherPending: integer("together_pending", { mode: "boolean" }).notNull().default(false),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [primaryKey({ columns: [table.athleteId, table.trackId] })]);
+
+export const weekTypeTemplates = sqliteTable("week_type_templates", {
+  id: text("id").primaryKey(),
+  teamId: text("team_id").notNull().references(() => trainingTeams.id),
+  name: text("name").notNull(),
+  rationale: text("rationale").notNull().default(""),
+  hardTarget: integer("hard_target").notNull().default(2),
+  strengthTarget: integer("strength_target").notNull().default(2),
+  easyTarget: integer("easy_target").notNull().default(2),
+  defaultLocationId: text("default_location_id").references(() => trainingLocations.id),
+  priorityEmphasis: text("priority_emphasis").notNull().default("balanced"),
+  isBuiltIn: integer("is_built_in", { mode: "boolean" }).notNull().default(false),
+  active: integer("active", { mode: "boolean" }).notNull().default(true),
+  baseJson: text("base_json").notNull().default("{}"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+});
+
+export const weekTypeDayIntents = sqliteTable("week_type_day_intents", {
+  id: text("id").primaryKey(),
+  weekTypeId: text("week_type_id").notNull().references(() => weekTypeTemplates.id),
+  day: integer("day").notNull(),
+  intent: text("intent").notNull(),
+  workoutId: text("workout_id").references(() => workoutLibraryItems.id),
+  strengthTemplateId: text("strength_template_id").references(() => strengthTemplates.id),
+  progressionTrackId: text("progression_track_id").references(() => progressionTracks.id),
+  locationId: text("location_id").references(() => trainingLocations.id),
+  priorityEmphasis: text("priority_emphasis").notNull().default("balanced"),
+}, (table) => [uniqueIndex("week_type_day_intent_unique").on(table.weekTypeId, table.day)]);
+
+export const programmeWeekRecommendations = sqliteTable("programme_week_recommendations", {
+  id: text("id").primaryKey(),
+  weekId: text("week_id").notNull().references(() => plannedWeeks.id),
+  phaseId: text("phase_id").references(() => trainingPhases.id),
+  weekTypeId: text("week_type_id").references(() => weekTypeTemplates.id),
+  progressionTrackId: text("progression_track_id").references(() => progressionTracks.id),
+  title: text("title").notNull().default(""),
+  rationale: text("rationale").notNull().default(""),
+  qualityIntent: text("quality_intent").notNull().default(""),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [uniqueIndex("programme_week_recommendation_week_unique").on(table.weekId)]);
 
 export const athleteExerciseSettings = sqliteTable(
   "athlete_exercise_settings",
@@ -322,6 +511,8 @@ export const workoutLibraryItems = sqliteTable("workout_library_items", {
   deletedAt: text("deleted_at"),
   createdAt: text("created_at").notNull().default(""),
   updatedAt: text("updated_at").notNull().default(""),
+  strengthTemplateId: text("strength_template_id"),
+  priorityEmphasis: text("priority_emphasis").notNull().default("balanced"),
 });
 
 export const workoutFavourites = sqliteTable(

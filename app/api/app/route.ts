@@ -5,6 +5,7 @@ import {
   eq,
   inArray,
   isNull,
+  sql,
 } from "drizzle-orm";
 import { getChatGPTUser, type ChatGPTUser } from "@/app/chatgpt-auth";
 import { getDb } from "@/db";
@@ -35,6 +36,20 @@ import {
   workoutLibraryItems,
   workoutFavourites,
   workoutResults,
+  athleteCurrentLocations,
+  athleteHyroxPriorities,
+  catalogueExercises,
+  locationEquipment,
+  programmeWeekRecommendations,
+  progressionSteps,
+  progressionStatesV2,
+  progressionTracks,
+  strengthFocusSlots,
+  strengthTemplates,
+  trainingFocuses,
+  trainingLocations,
+  weekTypeDayIntents,
+  weekTypeTemplates,
 } from "@/db/schema";
 import {
   addDays,
@@ -42,7 +57,9 @@ import {
   WEEK_TYPE_INFO,
   workoutTemplateIdForSession,
 } from "@/lib/training-data";
+import { V2_HYROX_STATIONS } from "@/lib/v2-catalogue";
 import { calculateProgression, categoryTotals } from "@/lib/training-logic";
+import { d1InsertBatches } from "@/lib/d1-limits";
 
 export const dynamic = "force-dynamic";
 
@@ -305,6 +322,23 @@ async function loadAppData(
 
   const week = chooseWeek(weekRows, requestedWeekId);
   if (!week) throw new Error("No planned week is available.");
+
+  const [focusRowsV2, catalogueRowsV2, locationRowsV2, equipmentRowsV2, currentLocationRowsV2, priorityRowsV2, builderTemplateRowsV2, builderSlotRowsV2, trackRowsV2, trackStepRowsV2, trackStateRowsV2, weekTypeRowsV2, weekIntentRowsV2, recommendationRowsV2] = await Promise.all([
+    db.select().from(trainingFocuses).where(eq(trainingFocuses.active, true)).orderBy(asc(trainingFocuses.name)),
+    db.select().from(catalogueExercises).where(eq(catalogueExercises.active, true)).orderBy(asc(catalogueExercises.trainingFocus), asc(catalogueExercises.focusRank)),
+    db.select().from(trainingLocations).where(eq(trainingLocations.active, true)).orderBy(asc(trainingLocations.name)),
+    db.select().from(locationEquipment),
+    db.select().from(athleteCurrentLocations),
+    db.select().from(athleteHyroxPriorities).orderBy(asc(athleteHyroxPriorities.rank)),
+    db.select().from(strengthTemplates).where(eq(strengthTemplates.active, true)).orderBy(asc(strengthTemplates.name)),
+    db.select().from(strengthFocusSlots).orderBy(asc(strengthFocusSlots.sortOrder)),
+    db.select().from(progressionTracks).where(eq(progressionTracks.active, true)).orderBy(asc(progressionTracks.name)),
+    db.select().from(progressionSteps).orderBy(asc(progressionSteps.sortOrder)),
+    db.select().from(progressionStatesV2),
+    db.select().from(weekTypeTemplates).where(eq(weekTypeTemplates.active, true)).orderBy(asc(weekTypeTemplates.name)),
+    db.select().from(weekTypeDayIntents).orderBy(asc(weekTypeDayIntents.day)),
+    db.select().from(programmeWeekRecommendations),
+  ]);
 
   const [sessionRows, originalRows, allSessionRows, feedRows, recentRows, historyRows] =
     await Promise.all([
@@ -679,6 +713,79 @@ async function loadAppData(
   }));
   const partner = athleteRows.find((athlete) => athlete.id !== actor.id) ?? null;
 
+  const v2 = {
+    trainingFocuses: focusRowsV2.map((focus) => ({
+      id: focus.id,
+      name: focus.name,
+      purpose: focus.purpose,
+      defaultPrescription: focus.defaultPrescription,
+      primaryMuscles: focus.primaryMuscles,
+      hyroxLinks: parseJson<string[]>(focus.hyroxLinksJson, []),
+      programmingNotes: focus.programmingNotes,
+      isBuiltIn: focus.isBuiltIn,
+      active: focus.active,
+    })),
+    catalogue: catalogueRowsV2.map((exercise) => ({
+      id: exercise.id,
+      name: exercise.name,
+      family: exercise.family,
+      trainingFocus: exercise.trainingFocus,
+      secondaryFocus: exercise.secondaryFocus,
+      tier: exercise.tier,
+      defaultVisibility: exercise.defaultVisibility,
+      focusRank: exercise.focusRank,
+      primaryEquipment: exercise.primaryEquipment,
+      secondaryEquipment: exercise.secondaryEquipment,
+      primaryMuscleGroup: exercise.primaryMuscleGroup,
+      secondaryMuscleGroups: exercise.secondaryMuscleGroups,
+      helpsWith: parseJson<string[]>(exercise.helpsWithJson, []),
+      directHyrox: exercise.directHyrox,
+      prescription: exercise.prescription,
+      loadConvention: exercise.loadConvention,
+      defaultIncrementKg: exercise.defaultIncrementKg,
+      demoUrl: exercise.demoUrl,
+      explanationUrl: exercise.explanationUrl,
+      legacyExerciseId: exercise.legacyExerciseId,
+    })),
+    locations: locationRowsV2.map((location) => ({
+      id: location.id,
+      name: location.name,
+      notes: location.notes,
+      equipment: equipmentRowsV2.filter((item) => item.locationId === location.id).map((item) => item.equipment),
+      active: location.active,
+    })),
+    currentLocationId: currentLocationRowsV2.find((item) => item.athleteId === actor.id)?.locationId ?? null,
+    priorities: Object.fromEntries(athleteRows.map((athlete) => [athlete.id, priorityRowsV2.filter((item) => item.athleteId === athlete.id).sort((a, b) => a.rank - b.rank).map((item) => item.station)])),
+    strengthTemplates: builderTemplateRowsV2.map((template) => ({
+      id: template.id,
+      name: template.name,
+      purpose: template.purpose,
+      isBuiltIn: template.isBuiltIn,
+      slots: builderSlotRowsV2.filter((slot) => slot.templateId === template.id).map((slot) => ({
+        id: slot.id,
+        templateId: slot.templateId,
+        focusId: slot.focusId,
+        focusName: focusRowsV2.find((focus) => focus.id === slot.focusId)?.name ?? slot.focusId,
+        exerciseId: slot.exerciseId,
+        exerciseName: slot.exerciseId ? catalogueRowsV2.find((exercise) => exercise.id === slot.exerciseId)?.name ?? null : null,
+        prescription: slot.prescription,
+        sortOrder: slot.sortOrder,
+        notes: slot.notes,
+      })),
+    })),
+    progressionTracks: trackRowsV2.map((track) => ({
+      id: track.id,
+      name: track.name,
+      purpose: track.purpose,
+      isBuiltIn: track.isBuiltIn,
+      currentStep: trackStateRowsV2.find((state) => state.trackId === track.id && state.athleteId === actor.id)?.currentStep ?? 0,
+      togetherPending: trackStateRowsV2.some((state) => state.trackId === track.id && state.togetherPending),
+      steps: trackStepRowsV2.filter((step) => step.trackId === track.id).sort((a, b) => a.sortOrder - b.sortOrder),
+    })),
+    weekTypeTemplates: weekTypeRowsV2.map((template) => ({ ...template, intents: weekIntentRowsV2.filter((intent) => intent.weekTypeId === template.id).sort((a, b) => a.day - b.day) })),
+    programmeRecommendations: recommendationRowsV2,
+  };
+
   return {
     actor: {
       id: actor.id,
@@ -727,6 +834,7 @@ async function loadAppData(
     weekTypes: WEEK_TYPE_INFO,
     serverDate: today,
     coachAvailable: false,
+    v2,
   };
 }
 
@@ -1625,6 +1733,8 @@ export async function POST(request: Request) {
         notes: asString(body.notes, existing?.notes ?? ""),
         resultType,
         customResultLabel: asString(body.customResultLabel, existing?.customResultLabel ?? ""),
+        strengthTemplateId: asString(body.strengthTemplateId, existing?.strengthTemplateId ?? "") || null,
+        priorityEmphasis: asString(body.priorityEmphasis, existing?.priorityEmphasis ?? "balanced"),
         isBuiltIn: false,
         deletedAt: null,
         updatedAt: nowIso(),
@@ -1679,6 +1789,8 @@ export async function POST(request: Request) {
         notes: source.notes,
         resultType: source.resultType,
         customResultLabel: source.customResultLabel,
+        strengthTemplateId: source.strengthTemplateId,
+        priorityEmphasis: source.priorityEmphasis,
         isBuiltIn: false,
         createdAt: nowIso(),
         updatedAt: nowIso(),
@@ -1798,6 +1910,136 @@ export async function POST(request: Request) {
       return Response.json({ ok: true });
     }
 
+    if (action === "setCurrentLocation") {
+      const locationId = asString(body.locationId);
+      const [location] = await db.select().from(trainingLocations).where(and(eq(trainingLocations.id, locationId), eq(trainingLocations.teamId, TEAM_ID), eq(trainingLocations.active, true))).limit(1);
+      if (!location) return apiError("Choose an active team location.");
+      await db.insert(athleteCurrentLocations).values({ athleteId: actor.id, locationId, updatedAt: nowIso() }).onConflictDoUpdate({ target: athleteCurrentLocations.athleteId, set: { locationId, updatedAt: nowIso() } });
+      await createActivity(db, actor.id, "setting", `${actor.displayName} changed current training location to ${location.name}.`, locationId);
+      return Response.json({ ok: true });
+    }
+
+    if (action === "saveLocation") {
+      const locationId = asString(body.locationId);
+      const name = asString(body.name);
+      const equipment = Array.isArray(body.equipment) ? [...new Set(body.equipment.filter((item): item is string => typeof item === "string" && item.trim()).map((item) => item.trim()))] : [];
+      if (!name) return apiError("Location name is required.");
+      const id = locationId || `location-${crypto.randomUUID()}`;
+      const existing = locationId ? await db.select().from(trainingLocations).where(and(eq(trainingLocations.id, locationId), eq(trainingLocations.teamId, TEAM_ID))).limit(1).then((rows) => rows[0]) : null;
+      if (existing && existing.isBuiltIn && existing.name !== name) {
+        // Built-in locations are editable but remain non-destructively identified.
+      }
+      if (existing) await db.update(trainingLocations).set({ name, notes: asString(body.notes), active: true, updatedAt: nowIso() }).where(eq(trainingLocations.id, id));
+      else await db.insert(trainingLocations).values({ id, teamId: TEAM_ID, name, notes: asString(body.notes), active: true, updatedAt: nowIso() });
+      await db.delete(locationEquipment).where(eq(locationEquipment.locationId, id));
+      for (const batch of d1InsertBatches(equipment.map((item) => ({ locationId: id, equipment: item })))) await db.insert(locationEquipment).values(batch).onConflictDoNothing();
+      await createActivity(db, actor.id, "setting", `${actor.displayName} updated ${name} equipment.`, id);
+      return Response.json({ ok: true, locationId: id });
+    }
+
+    if (action === "deleteLocation") {
+      const locationId = asString(body.locationId);
+      const [location] = await db.select().from(trainingLocations).where(and(eq(trainingLocations.id, locationId), eq(trainingLocations.teamId, TEAM_ID))).limit(1);
+      if (!location) return apiError("Location not found.", 404);
+      const used = await db.select({ id: athleteCurrentLocations.athleteId }).from(athleteCurrentLocations).where(eq(athleteCurrentLocations.locationId, locationId)).limit(1);
+      if (used.length) return apiError("This location is currently selected by an athlete. Change their Current Location first.", 409);
+      const usedByWeeks = await db.select({ id: weekTypeTemplates.id }).from(weekTypeTemplates).where(eq(weekTypeTemplates.defaultLocationId, locationId)).limit(1);
+      if (usedByWeeks.length) return apiError("This location is used by a Week Type and cannot be deleted.", 409);
+      await db.update(trainingLocations).set({ active: false, updatedAt: nowIso() }).where(eq(trainingLocations.id, locationId));
+      return Response.json({ ok: true });
+    }
+
+    if (action === "savePriorities") {
+      const athleteId = asString(body.athleteId, actor.id);
+      if (!new Set([actor.id, "thomas", "kt"]).has(athleteId)) return apiError("Choose a valid athlete.");
+      if (athleteId !== actor.id) return apiError("You can only edit your own priorities.", 403);
+      const stations = Array.isArray(body.stations) ? body.stations.filter((item): item is string => typeof item === "string") : [];
+      const selected = stations.slice(0, 3);
+      if (new Set(selected).size !== selected.length || selected.some((station) => !V2_HYROX_STATIONS.includes(station as (typeof V2_HYROX_STATIONS)[number]))) return apiError("Choose up to three different HYROX stations.");
+      await db.delete(athleteHyroxPriorities).where(eq(athleteHyroxPriorities.athleteId, athleteId));
+      for (const batch of d1InsertBatches(selected.map((station, index) => ({ athleteId, rank: index + 1, station, updatedAt: nowIso() })))) await db.insert(athleteHyroxPriorities).values(batch);
+      await createActivity(db, actor.id, "setting", `${actor.displayName} updated their HYROX station priorities.`, athleteId);
+      return Response.json({ ok: true });
+    }
+
+    if (action === "createTrainingFocus" || action === "updateTrainingFocus") {
+      const focusId = asString(body.focusId);
+      const name = asString(body.name);
+      if (!name) return apiError("Training Focus name is required.");
+      const id = focusId || `focus-custom-${crypto.randomUUID()}`;
+      const existing = focusId ? await db.select().from(trainingFocuses).where(eq(trainingFocuses.id, focusId)).limit(1).then((rows) => rows[0]) : null;
+      if (existing?.isBuiltIn && action === "updateTrainingFocus") {
+        await db.update(trainingFocuses).set({ name, purpose: asString(body.purpose), defaultPrescription: asString(body.defaultPrescription), primaryMuscles: asString(body.primaryMuscles), programmingNotes: asString(body.programmingNotes), updatedAt: nowIso() }).where(eq(trainingFocuses.id, id));
+      } else if (existing) return apiError("That Training Focus already exists.", 409);
+      else await db.insert(trainingFocuses).values({ id, name, purpose: asString(body.purpose), defaultPrescription: asString(body.defaultPrescription), primaryMuscles: asString(body.primaryMuscles), hyroxLinksJson: JSON.stringify(Array.isArray(body.hyroxLinks) ? body.hyroxLinks : []), programmingNotes: asString(body.programmingNotes), isBuiltIn: false, active: true, baseJson: "{}", updatedAt: nowIso() });
+      return Response.json({ ok: true, focusId: id });
+    }
+
+    if (action === "saveStrengthTemplate") {
+      const templateId = asString(body.templateId);
+      const name = asString(body.name);
+      const slots = Array.isArray(body.slots) ? body.slots : [];
+      if (!name) return apiError("Strength template name is required.");
+      const id = templateId || `strength-template-${crypto.randomUUID()}`;
+      const existing = templateId ? await db.select().from(strengthTemplates).where(eq(strengthTemplates.id, templateId)).limit(1).then((rows) => rows[0]) : null;
+      if (existing) await db.update(strengthTemplates).set({ name, purpose: asString(body.purpose), updatedAt: nowIso() }).where(eq(strengthTemplates.id, id));
+      else await db.insert(strengthTemplates).values({ id, teamId: TEAM_ID, name, purpose: asString(body.purpose), isBuiltIn: false, active: true, updatedAt: nowIso() });
+      await db.delete(strengthFocusSlots).where(eq(strengthFocusSlots.templateId, id));
+      const slotRows = slots.map((slot, index) => {
+        const row = (slot ?? {}) as Record<string, unknown>;
+        return { id: asString(row.id) || `${id}-slot-${crypto.randomUUID()}`, templateId: id, focusId: asString(row.focusId), exerciseId: asString(row.exerciseId) || null, prescription: asString(row.prescription), sortOrder: index, notes: asString(row.notes) };
+      }).filter((row) => row.focusId);
+      for (const batch of d1InsertBatches(slotRows)) await db.insert(strengthFocusSlots).values(batch);
+      await createActivity(db, actor.id, "workout", `${actor.displayName} saved ${name} in the Strength Builder.`, id);
+      return Response.json({ ok: true, templateId: id });
+    }
+
+    if (action === "saveProgressionTrack") {
+      const trackId = asString(body.trackId);
+      const name = asString(body.name);
+      const steps = Array.isArray(body.steps) ? body.steps : [];
+      if (!name) return apiError("Progression name is required.");
+      const id = trackId || `track-custom-${crypto.randomUUID()}`;
+      const existing = trackId ? await db.select().from(progressionTracks).where(eq(progressionTracks.id, trackId)).limit(1).then((rows) => rows[0]) : null;
+      if (existing) await db.update(progressionTracks).set({ name, purpose: asString(body.purpose), updatedAt: nowIso() }).where(eq(progressionTracks.id, id));
+      else await db.insert(progressionTracks).values({ id, teamId: TEAM_ID, name, purpose: asString(body.purpose), isBuiltIn: false, active: true, updatedAt: nowIso() });
+      await db.delete(progressionSteps).where(eq(progressionSteps.trackId, id));
+      const rows = steps.map((step, index) => { const item = (step ?? {}) as Record<string, unknown>; return { id: asString(item.id) || `${id}-step-${crypto.randomUUID()}`, trackId: id, workoutId: asString(item.workoutId) || null, title: asString(item.title, `Step ${index + 1}`), prescription: asString(item.prescription), sortOrder: index }; });
+      for (const batch of d1InsertBatches(rows)) await db.insert(progressionSteps).values(batch);
+      return Response.json({ ok: true, trackId: id });
+    }
+
+    if (action === "updateWeekTypeTemplate") {
+      const templateId = asString(body.templateId);
+      const [template] = await db.select().from(weekTypeTemplates).where(eq(weekTypeTemplates.id, templateId)).limit(1);
+      if (!template) return apiError("Week Type not found.", 404);
+      const update = { name: asString(body.name, template.name), rationale: asString(body.rationale, template.rationale), hardTarget: Math.max(0, Math.round(asNumber(body.hardTarget, template.hardTarget) ?? template.hardTarget)), strengthTarget: Math.max(0, Math.round(asNumber(body.strengthTarget, template.strengthTarget) ?? template.strengthTarget)), easyTarget: Math.max(0, Math.round(asNumber(body.easyTarget, template.easyTarget) ?? template.easyTarget)), priorityEmphasis: asString(body.priorityEmphasis, template.priorityEmphasis), updatedAt: nowIso() };
+      await db.update(weekTypeTemplates).set(update).where(eq(weekTypeTemplates.id, templateId));
+      return Response.json({ ok: true, templateId });
+    }
+
+    if (action === "updateProgrammeWeek") {
+      const weekId = asString(body.weekId);
+      const [week] = await db.select().from(plannedWeeks).where(eq(plannedWeeks.id, weekId)).limit(1);
+      if (!week) return apiError("Programme week not found.", 404);
+      if (week.confirmedAt || week.status === "in_progress") return apiError("Set or in-progress weeks require normal Week editing.", 409);
+      const recommendation = { title: asString(body.title, week.title), rationale: asString(body.rationale, week.rationale), qualityIntent: asString(body.qualityIntent, week.qualityFocus), weekTypeId: asString(body.weekTypeId) || null, phaseId: asString(body.phaseId) || null, progressionTrackId: asString(body.progressionTrackId) || null };
+      await db.update(plannedWeeks).set({ title: recommendation.title, rationale: recommendation.rationale, qualityFocus: recommendation.qualityIntent, programmeWeekTypeId: recommendation.weekTypeId, programmePhaseId: recommendation.phaseId, updatedAt: nowIso() }).where(eq(plannedWeeks.id, weekId));
+      await db.insert(programmeWeekRecommendations).values({ id: `programme-recommendation-${weekId}`, weekId, ...recommendation, updatedAt: nowIso() }).onConflictDoUpdate({ target: programmeWeekRecommendations.weekId, set: { ...recommendation, updatedAt: nowIso() } });
+      return Response.json({ ok: true });
+    }
+
+    if (action === "completeProgressionStep") {
+      const trackId = asString(body.trackId);
+      const [track] = await db.select().from(progressionTracks).where(eq(progressionTracks.id, trackId)).limit(1);
+      if (!track) return apiError("Progression track not found.", 404);
+      const [state] = await db.select().from(progressionStatesV2).where(and(eq(progressionStatesV2.athleteId, actor.id), eq(progressionStatesV2.trackId, trackId))).limit(1);
+      const [stepCount] = await db.select({ count: sql<number>`count(*)` }).from(progressionSteps).where(eq(progressionSteps.trackId, trackId));
+      const next = Math.min((state?.currentStep ?? 0) + 1, Number(stepCount?.count ?? 0));
+      await db.insert(progressionStatesV2).values({ athleteId: actor.id, trackId, currentStep: next, togetherPending: false, updatedAt: nowIso() }).onConflictDoUpdate({ target: [progressionStatesV2.athleteId, progressionStatesV2.trackId], set: { currentStep: next, togetherPending: false, updatedAt: nowIso() } });
+      return Response.json({ ok: true, currentStep: next });
+    }
+
     if (action === "react") {
       const activityId = asString(body.activityId);
       const emoji = asString(body.emoji);
@@ -1882,6 +2124,23 @@ export async function POST(request: Request) {
       await db.update(events).set({ status: "completed" }).where(eq(events.id, eventId));
       await createActivity(db, actor.id, "review", `${actor.displayName} updated the ${event.name} race review.`, eventId);
       return Response.json({ ok: true });
+    }
+
+    if (action === "viewDuoBase") {
+      return Response.json({ ok: true, reference: "DUO base programme" });
+    }
+
+    if (action === "updatePhase") {
+      const phaseId = asString(body.phaseId);
+      const [phase] = await db.select().from(trainingPhases).where(eq(trainingPhases.id, phaseId)).limit(1);
+      if (!phase) return apiError("Phase not found.", 404);
+      const name = asString(body.name, phase.name);
+      const startDate = asString(body.startDate, phase.startDate);
+      const endDate = asString(body.endDate, phase.endDate);
+      if (!name || startDate > endDate) return apiError("Phase name and valid dates are required.");
+      const affected = await db.select({ id: plannedWeeks.id, confirmedAt: plannedWeeks.confirmedAt }).from(plannedWeeks).where(and(eq(plannedWeeks.blockId, phase.blockId), sql`${plannedWeeks.startDate} between ${startDate} and ${endDate}`));
+      await db.update(trainingPhases).set({ name, startDate, endDate, focus: asString(body.focus, phase.focus) }).where(eq(trainingPhases.id, phaseId));
+      return Response.json({ ok: true, phaseId, protectedWeeks: affected.filter((item) => item.confirmedAt).length });
     }
 
     if (action === "createBlock") {

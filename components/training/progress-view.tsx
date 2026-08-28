@@ -92,6 +92,17 @@ export function ProgressView({ data, mutate, route, onNavigate, onBack }: { data
     (week) => week.startDate <= data.serverDate,
   ).slice(-8);
   const pending = progress.filter((item) => item.recommendedLoadKg);
+  const muscleRecency = (() => {
+    const today = new Date(`${data.serverDate}T00:00:00Z`).getTime();
+    const exposure = new Map<string, number>();
+    for (const entry of data.exerciseHistory.filter((item) => item.athleteId === athleteId)) {
+      const catalogue = data.v2.catalogue.find((exercise) => exercise.legacyExerciseId === entry.exerciseId || exercise.name.toLowerCase() === entry.exerciseName.toLowerCase());
+      const muscles = catalogue ? [catalogue.primaryMuscleGroup, ...catalogue.secondaryMuscleGroups.split(";").map((item) => item.trim())] : [];
+      for (const muscle of muscles.filter(Boolean)) exposure.set(muscle, Math.max(exposure.get(muscle) ?? 0, new Date(`${entry.performedAt}T00:00:00Z`).getTime()));
+    }
+    const meaningful = ["Chest", "Hamstrings", "Calves", "Quads", "Glutes", "Back", "Shoulders", "Triceps", "Core", "Grip / Forearms"];
+    return meaningful.map((muscle) => ({ muscle, days: exposure.has(muscle) ? Math.max(0, Math.round((today - (exposure.get(muscle) ?? today)) / 86_400_000)) : null })).sort((a, b) => (b.days ?? 9999) - (a.days ?? 9999)).slice(0, 3);
+  })();
   const selected = (data.progress[data.actor.id] ?? []).find((item) => item.exerciseId === route.exerciseId);
   if (selected) return <ExerciseSettingsView state={selected} mutate={mutate} onBack={onBack} />;
 
@@ -157,6 +168,12 @@ export function ProgressView({ data, mutate, route, onNavigate, onBack }: { data
         ) : (
           <div className="consistency-placeholder"><BarChart3 /><p>Consistency will populate as training weeks are completed.</p></div>
         )}
+      </section>
+
+      <section className="performance-card neglected-muscles-card">
+        <SectionHeading eyebrow="Strength recency" title="Most neglected" />
+        <div className="neglected-muscle-list">{muscleRecency.map((item) => <div key={item.muscle}><strong>{item.muscle}</strong><span>{item.days === null ? "No logged strength exposure" : `${item.days} day${item.days === 1 ? "" : "s"}`}</span></div>)}</div>
+        <p className="target-footnote">Based on logged primary and meaningful secondary strength work. Incidental conditioning does not reset recency.</p>
       </section>
 
       <section className="progress-principles-grid">

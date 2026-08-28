@@ -23,6 +23,22 @@ import {
   workoutLibraryItems,
   workoutFavourites,
   workoutResults,
+  athleteCurrentLocations,
+  athleteHyroxPriorities,
+  catalogueExercises,
+  exerciseFocusLinks,
+  focusHyroxRelationships,
+  locationEquipment,
+  programmeWeekRecommendations,
+  progressionSteps,
+  progressionStatesV2,
+  progressionTracks,
+  strengthFocusSlots,
+  strengthTemplates,
+  trainingFocuses,
+  trainingLocations,
+  weekTypeDayIntents,
+  weekTypeTemplates,
 } from "./schema";
 import {
   addDays,
@@ -35,12 +51,18 @@ import {
   SLOT_ALTERNATIVES,
   STRENGTH_SLOT_SEEDS,
   TEAM_ID,
+  WEEK_TYPE_INFO,
   WEEK_SEEDS,
   WORKOUT_LIBRARY_SEEDS,
   workoutTemplateIdForSession,
   type WeekSeed,
 } from "@/lib/training-data";
 import { d1InsertBatches } from "@/lib/d1-limits";
+import {
+  V2_EXERCISE_CATALOGUE,
+  V2_HYROX_FOCUS_RELATIONSHIPS,
+  V2_TRAINING_FOCUSES,
+} from "@/lib/v2-catalogue";
 
 export type TrainingDb = ReturnType<typeof getDb>;
 
@@ -65,6 +87,18 @@ export async function resetTrainingData(db: TrainingDb) {
   await db.delete(events);
   await db.delete(trainingPhases);
   await db.delete(workoutFavourites);
+  await db.delete(athleteHyroxPriorities);
+  await db.delete(athleteCurrentLocations);
+  await db.delete(programmeWeekRecommendations);
+  await db.delete(weekTypeDayIntents);
+  await db.delete(weekTypeTemplates).where(eq(weekTypeTemplates.isBuiltIn, false));
+  await db.delete(progressionStatesV2);
+  await db.delete(progressionSteps);
+  await db.delete(progressionTracks).where(eq(progressionTracks.isBuiltIn, false));
+  await db.delete(strengthFocusSlots);
+  await db.delete(strengthTemplates).where(eq(strengthTemplates.isBuiltIn, false));
+  await db.delete(locationEquipment);
+  await db.delete(trainingLocations).where(eq(trainingLocations.active, false));
   await db.delete(workoutLibraryItems).where(eq(workoutLibraryItems.isBuiltIn, false));
   await db.delete(trainingBlocks);
   // The seed marker is intentionally removed so ensureSeeded rebuilds the
@@ -125,6 +159,143 @@ async function ensureV11Data(db: TrainingDb) {
   }
 }
 
+function focusIdForName(name: string) {
+  return V2_TRAINING_FOCUSES.find((focus) => focus.name === name)?.id ?? null;
+}
+
+/** Additive, idempotent V2 catalogue/programme seed. It deliberately keeps
+ * legacy `exercises` rows as the source of existing history and records a
+ * deterministic catalogue-to-legacy alias where names match. */
+async function ensureV2Data(db: TrainingDb) {
+  const now = new Date().toISOString();
+  const focusRows = V2_TRAINING_FOCUSES.map((focus) => ({
+    id: focus.id,
+    name: focus.name,
+    purpose: focus.purpose,
+    defaultPrescription: focus.defaultPrescription,
+    primaryMuscles: focus.primaryMuscles,
+    sourcePatterns: focus.sourcePatterns,
+    hyroxLinksJson: JSON.stringify(focus.hyroxLinks.split(";").map((item) => item.trim()).filter(Boolean)),
+    programmingNotes: focus.programmingNotes,
+    isBuiltIn: true,
+    active: true,
+    baseJson: JSON.stringify(focus),
+    updatedAt: now,
+  }));
+  for (const batch of d1InsertBatches(focusRows)) await db.insert(trainingFocuses).values(batch).onConflictDoNothing();
+
+  const legacyExercises = await db.select().from(exercises);
+  const legacyByName = new Map(legacyExercises.map((exercise) => [exercise.name.toLowerCase(), exercise.id]));
+  const catalogueRows = V2_EXERCISE_CATALOGUE.map((exercise) => ({
+    id: exercise.id,
+    name: exercise.name,
+    sourceType: exercise.sourceType,
+    sourceRow: exercise.sourceRow,
+    family: exercise.family,
+    trainingFocus: exercise.trainingFocus,
+    secondaryFocus: exercise.secondaryFocus,
+    tier: exercise.tier,
+    defaultVisibility: exercise.defaultVisibility,
+    focusRank: exercise.focusRank,
+    difficulty: exercise.difficulty,
+    primaryEquipment: exercise.primaryEquipment,
+    secondaryEquipment: exercise.secondaryEquipment,
+    bodyRegion: exercise.bodyRegion,
+    movementPattern: exercise.movementPattern,
+    mechanics: exercise.mechanics,
+    laterality: exercise.laterality,
+    primaryMuscleGroup: exercise.primaryMuscleGroup,
+    secondaryMuscleGroups: exercise.secondaryMuscleGroups ?? "",
+    helpsWithJson: JSON.stringify(exercise.helpsWith.split(";").map((item) => item.trim()).filter(Boolean)),
+    directHyrox: exercise.directHyrox === "Yes",
+    prescription: exercise.prescription,
+    loadConvention: exercise.loadConvention,
+    defaultIncrementKg: exercise.defaultIncrementKg,
+    demoUrl: exercise.demoUrl,
+    explanationUrl: exercise.explanationUrl,
+    whyDuoKeeps: exercise.whyDuoKeeps,
+    legacyExerciseId: legacyByName.get(exercise.name.toLowerCase()) ?? null,
+    isBuiltIn: true,
+    active: true,
+    updatedAt: now,
+  }));
+  for (const batch of d1InsertBatches(catalogueRows)) await db.insert(catalogueExercises).values(batch).onConflictDoNothing();
+
+  const links = V2_EXERCISE_CATALOGUE.flatMap((exercise) => {
+    const primary = focusIdForName(exercise.trainingFocus);
+    const secondary = exercise.secondaryFocus ? focusIdForName(exercise.secondaryFocus) : null;
+    return [
+      primary ? { exerciseId: exercise.id, focusId: primary, relationship: "primary" } : null,
+      secondary ? { exerciseId: exercise.id, focusId: secondary, relationship: "secondary" } : null,
+    ].filter(Boolean) as Array<{ exerciseId: string; focusId: string; relationship: string }>;
+  });
+  for (const batch of d1InsertBatches(links)) await db.insert(exerciseFocusLinks).values(batch).onConflictDoNothing();
+
+  const relationships = V2_HYROX_FOCUS_RELATIONSHIPS.flatMap((relationship) => {
+    const focusId = focusIdForName(relationship.focus);
+    return focusId ? [{ focusId, station: relationship.station, score: relationship.score }] : [];
+  });
+  for (const batch of d1InsertBatches(relationships)) await db.insert(focusHyroxRelationships).values(batch).onConflictDoNothing();
+
+  const locationRows = [
+    { id: "location-building-gym", teamId: TEAM_ID, name: "Building Gym", notes: "Default shared gym", active: true, updatedAt: now },
+    { id: "location-perpetua", teamId: TEAM_ID, name: "Perpetua", notes: "Class and treadmill access", active: true, updatedAt: now },
+    { id: "location-everlast", teamId: TEAM_ID, name: "Everlast Performance Centre", notes: "Race-specific HYROX equipment", active: true, updatedAt: now },
+  ];
+  for (const batch of d1InsertBatches(locationRows)) await db.insert(trainingLocations).values(batch).onConflictDoNothing();
+  const equipment = new Set<string>([
+    "Smith Machine", "Dumbbell", "Leg Press Machine", "Leg Curl Machine", "Leg Extension Machine", "Cable Station", "Treadmill", "Barbell", "Bench", "SkiErg", "RowErg", "Sled", "Wall Balls", "Sandbag", "Farmer Carry Implements",
+    ...V2_EXERCISE_CATALOGUE.flatMap((exercise) => [exercise.primaryEquipment, exercise.secondaryEquipment]).filter((item) => item && item !== "None"),
+  ]);
+  const equipmentRows = ["location-building-gym", "location-perpetua", "location-everlast"].flatMap((locationId) => [...equipment].map((item) => ({ locationId, equipment: item })));
+  for (const batch of d1InsertBatches(equipmentRows)) await db.insert(locationEquipment).values(batch).onConflictDoNothing();
+  const currentLocations = ["thomas", "kt"].map((athleteId) => ({ athleteId, locationId: "location-building-gym", updatedAt: now }));
+  for (const batch of d1InsertBatches(currentLocations)) await db.insert(athleteCurrentLocations).values(batch).onConflictDoNothing();
+
+  const templates = [
+    { id: "strength-template-a", teamId: TEAM_ID, name: "Strength A", purpose: "DUO base squat / push emphasis", isBuiltIn: true, baseTemplateId: null, active: true, updatedAt: now },
+    { id: "strength-template-b", teamId: TEAM_ID, name: "Strength B", purpose: "DUO base hinge / pull emphasis", isBuiltIn: true, baseTemplateId: null, active: true, updatedAt: now },
+  ];
+  for (const batch of d1InsertBatches(templates)) await db.insert(strengthTemplates).values(batch).onConflictDoNothing();
+  const slotRows = await db.select().from(strengthSlots);
+  const focusSlots = slotRows.map((slot) => ({
+    id: `v2-${slot.id}`,
+    templateId: slot.workoutKind === "strength-a" ? "strength-template-a" : "strength-template-b",
+    focusId: focusIdForName(slot.trainingGoal) ?? "focus-heavy-knee",
+    exerciseId: V2_EXERCISE_CATALOGUE.find((exercise) => exercise.name.toLowerCase() === (legacyExercises.find((item) => item.id === slot.defaultExerciseId)?.name ?? "").toLowerCase())?.id ?? null,
+    prescription: `${slot.workingSets} × ${slot.repLow}–${slot.repHigh}`,
+    sortOrder: slot.sortOrder,
+    notes: "DUO base slot; editable without changing exercise history",
+  }));
+  for (const batch of d1InsertBatches(focusSlots)) await db.insert(strengthFocusSlots).values(batch).onConflictDoNothing();
+
+  const progressionSeeds = [
+    { id: "track-lt2-running", name: "LT2 Running", purpose: "Build sustainable threshold running", steps: [["3 × 8 min", "3 × 8 min"], ["3 × 10 min", "3 × 10 min"], ["2 × 20 min", "2 × 20 min"], ["4 × 10 min", "4 × 10 min"]] },
+    { id: "track-vo2-running", name: "VO₂ Running", purpose: "Develop repeatable faster running", steps: [["8 × 2 min", "8 × 2 min"], ["6 × 3 min", "6 × 3 min"]] },
+    { id: "track-hyrox-threshold", name: "HYROX Threshold", purpose: "Sustain high output through stations", steps: [["25-min threshold AMRAP", "25 min"], ["35-min threshold AMRAP", "35 min"]] },
+    { id: "track-hyrox-compromised", name: "HYROX Compromised Running", purpose: "Regain running rhythm after stations", steps: [["4 rounds compromised", "4 rounds"], ["5 rounds compromised", "5 rounds"]] },
+  ];
+  for (const track of progressionSeeds) {
+    await db.insert(progressionTracks).values({ id: track.id, teamId: TEAM_ID, name: track.name, purpose: track.purpose, isBuiltIn: true, active: true, updatedAt: now }).onConflictDoNothing();
+    const rows = track.steps.map(([title, prescription], index) => ({ id: `${track.id}-${index + 1}`, trackId: track.id, workoutId: null, title, prescription, sortOrder: index }));
+    for (const batch of d1InsertBatches(rows)) await db.insert(progressionSteps).values(batch).onConflictDoNothing();
+  }
+
+  const weekTypeRows = Object.entries(WEEK_TYPE_INFO).map(([id, info]) => ({
+    id: `week-type-${id}`, teamId: TEAM_ID, name: info.label, rationale: info.rationale, hardTarget: info.targets.hard, strengthTarget: info.targets.strength, easyTarget: info.targets.easy, defaultLocationId: "location-building-gym", priorityEmphasis: "balanced", isBuiltIn: true, active: true, baseJson: JSON.stringify(info), updatedAt: now,
+  }));
+  for (const batch of d1InsertBatches(weekTypeRows)) await db.insert(weekTypeTemplates).values(batch).onConflictDoNothing();
+  const dayIntents = weekTypeRows.flatMap((weekType) => Array.from({ length: 7 }, (_, day) => ({ id: `${weekType.id}-${day}`, weekTypeId: weekType.id, day, intent: day === 0 ? "Hard Conditioning" : day === 2 ? "Strength" : day === 3 ? "Running Quality" : day === 5 ? "Easy Aerobic" : "Rest / Recovery", priorityEmphasis: "balanced" })));
+  for (const batch of d1InsertBatches(dayIntents)) await db.insert(weekTypeDayIntents).values(batch).onConflictDoNothing();
+  const weeks = await db.select().from(plannedWeeks);
+  const phases = await db.select().from(trainingPhases);
+  const recommendations = weeks.map((week) => {
+    const phase = phases.find((item) => item.blockId === week.blockId && item.startDate <= week.startDate && item.endDate >= week.startDate);
+    return { id: `programme-recommendation-${week.id}`, weekId: week.id, phaseId: phase?.id ?? null, weekTypeId: `week-type-${week.weekType}`, progressionTrackId: week.qualityFocus.toLowerCase().includes("vo") ? "track-vo2-running" : week.qualityFocus.toLowerCase().includes("lt2") ? "track-lt2-running" : week.qualityFocus.toLowerCase().includes("hyrox") ? "track-hyrox-threshold" : null, title: week.title, rationale: week.rationale, qualityIntent: week.qualityFocus, updatedAt: now };
+  });
+  for (const batch of d1InsertBatches(recommendations)) await db.insert(programmeWeekRecommendations).values(batch).onConflictDoNothing();
+}
+
 export async function ensureSeeded(db: TrainingDb) {
   const [seedMarker] = await db
     .select({ id: activityFeedItems.id })
@@ -137,12 +308,13 @@ export async function ensureSeeded(db: TrainingDb) {
       .from(appMetadata)
       .where(eq(appMetadata.key, "data-version"))
       .limit(1);
-    if (!versionMarker || versionMarker.value !== "1.5") {
+    if (!versionMarker || versionMarker.value !== "2.0") {
       await ensureV11Data(db);
+      await ensureV2Data(db);
       await db
         .insert(appMetadata)
-        .values({ key: "data-version", value: "1.5", updatedAt: new Date().toISOString() })
-        .onConflictDoUpdate({ target: appMetadata.key, set: { value: "1.5", updatedAt: new Date().toISOString() } });
+        .values({ key: "data-version", value: "2.0", updatedAt: new Date().toISOString() })
+        .onConflictDoUpdate({ target: appMetadata.key, set: { value: "2.0", updatedAt: new Date().toISOString() } });
     }
     return;
   }
@@ -286,9 +458,10 @@ export async function ensureSeeded(db: TrainingDb) {
   }
 
   await ensureV11Data(db);
+  await ensureV2Data(db);
   await db
     .insert(appMetadata)
-    .values({ key: "data-version", value: "1.5", updatedAt: new Date().toISOString() })
+    .values({ key: "data-version", value: "2.0", updatedAt: new Date().toISOString() })
     .onConflictDoNothing();
 }
 
