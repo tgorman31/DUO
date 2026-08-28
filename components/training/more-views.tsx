@@ -130,7 +130,7 @@ function RaceReviewDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="training-dialog race-review-dialog">
+      <DialogContent className="training-dialog race-review-dialog" mode="responsive-editor">
         <DialogHeader>
           <DialogTitle>{event.name} race review</DialogTitle>
           <DialogDescription>Shared doubles analysis plus {data.actor.displayName}’s private reflection.</DialogDescription>
@@ -252,7 +252,7 @@ function NewBlockDialog({ open, onOpenChange, mutate }: { open: boolean; onOpenC
   };
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="training-dialog new-block-dialog">
+      <DialogContent className="training-dialog new-block-dialog" mode="responsive-editor">
         <DialogHeader><DialogTitle>New training block</DialogTitle><DialogDescription>Create durable phases and a target event without changing historical blocks.</DialogDescription></DialogHeader>
         <div className="dialog-form-grid">
           <div className="field-stack"><Label htmlFor="block-name">Block name</Label><Input id="block-name" value={form.name} onChange={(event) => update("name", event.target.value)} placeholder="Spring 10K → Summer HYROX" /></div>
@@ -336,7 +336,7 @@ function WorkoutFormDialog({ item, open, onOpenChange, mutate, onSaved }: { item
   };
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="training-dialog workout-form-dialog">
+      <DialogContent className="training-dialog workout-form-dialog" mode="responsive-editor">
         <DialogHeader><DialogTitle>{item ? "Edit workout" : "Create workout"}</DialogTitle><DialogDescription>Reusable prescription and weekly training classification.</DialogDescription></DialogHeader>
         <div className="dialog-form-grid">
           <div className="field-stack"><Label htmlFor="workout-name">Name</Label><Input id="workout-name" value={form.name} onChange={(event) => update("name", event.target.value)} /></div>
