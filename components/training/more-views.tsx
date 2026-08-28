@@ -340,13 +340,17 @@ function StrengthBuilderPanel({
   const [showAll, setShowAll] = useState<Record<string, boolean>>({});
   const currentLocation = data.v2.locations.find((location) => location.id === data.v2.currentLocationId);
   const equipment = currentLocation?.equipment ?? [];
-  const available = (equipmentName: string) => !equipmentName || equipment.some((item) => item.toLowerCase().includes(equipmentName.toLowerCase()) || equipmentName.toLowerCase().includes(item.toLowerCase()));
+  const normaliseEquipment = (value: string) => value.toLowerCase().replace(/[()\-]/g, " ").replace(/\s+/g, " ").trim();
+  const available = (equipmentName: string) => {
+    const required = normaliseEquipment(equipmentName);
+    return !required || required === "none" || equipment.some((item) => normaliseEquipment(item) === required);
+  };
   const focusMap = useMemo(() => new Map(data.v2.trainingFocuses.map((focus) => [focus.id, focus])), [data.v2.trainingFocuses]);
   const exerciseOptions = (focusId: string) => {
     const focus = focusMap.get(focusId);
     if (!focus) return [];
     return data.v2.catalogue
-      .filter((exercise) => exercise.trainingFocus === focus.name && available(exercise.primaryEquipment))
+      .filter((exercise) => exercise.trainingFocus === focus.name && available(exercise.primaryEquipment) && available(exercise.secondaryEquipment))
       .sort((a, b) => (a.tier === b.tier ? a.focusRank - b.focusRank : a.tier === "Core" ? -1 : b.tier === "Core" ? 1 : 0));
   };
   const addFocus = () => {
