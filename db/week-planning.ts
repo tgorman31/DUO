@@ -1,6 +1,6 @@
 import { eq } from "drizzle-orm";
 import type { TrainingDb } from "./seed";
-import { athleteSessions, plannedWeeks, sharedSessions, strengthTemplates, weekTypeDayIntents, workoutLibraryItems } from "./schema";
+import { athleteSessions, plannedWeeks, sharedSessions, strengthTemplates, weekTypeDayIntents, workoutLibraryItems, progressionTracks, progressionSteps, progressionStatesV2 } from "./schema";
 import {
   addDays,
   scheduleForWeek,
@@ -121,8 +121,9 @@ export async function reconcileRecommendedWeek(
 export async function reconcileV2RecommendedWeek(
   db: TrainingDb,
   week: WeekPlanBasis,
-  intents: Array<typeof weekTypeDayIntents.$inferSelect>,
+  intents: Array<typeof weekTypeDayIntents.$inferSelect | { id: string; weekId: string; day: number; intent: string; workoutId: string | null; strengthTemplateId: string | null; progressionTrackId: string | null; locationId: string | null; priorityEmphasis: string; category?: string; workoutKind?: string; details?: string }>,
   activate: boolean,
+  options: { defaultLocationId?: string | null; athleteId?: string } = {},
 ) {
   const now = new Date().toISOString();
   const currentAthleteRows = await db.select().from(athleteSessions).where(eq(athleteSessions.weekId, week.id));
@@ -132,19 +133,44 @@ export async function reconcileV2RecommendedWeek(
     const template = intent.strengthTemplateId ? await db.select().from(strengthTemplates).where(eq(strengthTemplates.id, intent.strengthTemplateId)).limit(1).then((rows) => rows[0]) : null;
     let workout = intent.workoutId ? await db.select().from(workoutLibraryItems).where(eq(workoutLibraryItems.id, intent.workoutId)).limit(1).then((rows) => rows[0]) : null;
     if (!workout && template) workout = await db.select().from(workoutLibraryItems).where(eq(workoutLibraryItems.strengthTemplateId, template.id)).limit(1).then((rows) => rows[0]);
-    const lower = intent.intent.toLowerCase();
-    const category = workout?.category ?? (lower.includes("rest") || lower.includes("recovery") ? "recovery" : lower.includes("strength") ? "strength" : lower.includes("easy") ? "easy" : "hard");
-    const workoutKind = workout?.family === "strength" || template ? (template?.id === "strength-template-b" ? "strength-b" : template?.id === "strength-template-a" ? "strength-a" : "strength-custom") : category === "recovery" ? "recovery" : workout?.family ?? category;
+    let title = workout?.name ?? template?.name ?? intent.intent;
+    const intentMeta = intent as { details?: string; category?: string; workoutKind?: string };
+    let details = workout?.purpose ?? template?.purpose ?? intentMeta.details ?? intent.intent;
+    let resolvedWorkoutId = intent.workoutId ?? workout?.id ?? null;
+    let category = workout?.category ?? intentMeta.category ?? (intent.intent.toLowerCase().includes("rest") || intent.intent.toLowerCase().includes("recovery") ? "recovery" : intent.intent.toLowerCase().includes("strength") ? "strength" : intent.intent.toLowerCase().includes("easy") ? "easy" : "hard");
+    let workoutKind = workout?.family === "strength" || template ? (template?.id === "strength-template-b" ? "strength-b" : template?.id === "strength-template-a" ? "strength-a" : "strength-custom") : category === "recovery" ? "recovery" : intentMeta.workoutKind || workout?.family || category;
+
+    // Resolve a programme-specific progression choice to its current step.
+    // Completion, not elapsed calendar time, advances progression state.
+    if (intent.progressionTrackId) {
+      const [track] = await db.select().from(progressionTracks).where(eq(progressionTracks.id, intent.progressionTrackId)).limit(1);
+      if (track) {
+        const state = options.athleteId
+          ? await db.select().from(progressionStatesV2).where(eq(progressionStatesV2.trackId, track.id)).limit(10).then((rows) => rows.find((row) => row.athleteId === options.athleteId))
+          : null;
+        const steps = await db.select().from(progressionSteps).where(eq(progressionSteps.trackId, track.id)).orderBy(progressionSteps.sortOrder);
+        const step = steps[Math.min(state?.currentStep ?? 0, Math.max(steps.length - 1, 0))];
+        if (step) {
+          const linkedWorkout = step.workoutId ? await db.select().from(workoutLibraryItems).where(eq(workoutLibraryItems.id, step.workoutId)).limit(1).then((rows) => rows[0]) : null;
+          title = linkedWorkout?.name ?? step.title;
+          details = linkedWorkout?.purpose ?? step.prescription ?? details;
+          category = linkedWorkout?.category ?? category;
+          workoutKind = linkedWorkout?.family ?? workoutKind;
+          workout = linkedWorkout ?? workout;
+          resolvedWorkoutId = linkedWorkout?.id ?? null;
+        }
+      }
+    }
     const row = {
       id: `shared-${week.id}-${intent.day}`,
       weekId: week.id,
       scheduledDate: addDays(week.startDate, intent.day),
-      title: workout?.name ?? template?.name ?? intent.intent,
+      title,
       category,
       workoutKind,
-      details: workout?.purpose ?? template?.purpose ?? intent.intent,
-      workoutTemplateId: intent.workoutId ?? workout?.id ?? null,
-      locationId: intent.locationId ?? null,
+      details,
+      workoutTemplateId: resolvedWorkoutId,
+      locationId: intent.locationId ?? options.defaultLocationId ?? null,
       assignment: "together",
       sortOrder: intent.day,
     };

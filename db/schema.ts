@@ -396,6 +396,22 @@ export const weekTypeDayIntents = sqliteTable("week_type_day_intents", {
   priorityEmphasis: text("priority_emphasis").notNull().default("balanced"),
 }, (table) => [uniqueIndex("week_type_day_intent_unique").on(table.weekTypeId, table.day)]);
 
+/** A programme-week-specific copy/override of a reusable Week Type intent. */
+export const programmeWeekDayIntents = sqliteTable("programme_week_day_intents", {
+  id: text("id").primaryKey(),
+  weekId: text("week_id").notNull().references(() => plannedWeeks.id),
+  day: integer("day").notNull(),
+  intent: text("intent").notNull(),
+  workoutId: text("workout_id").references(() => workoutLibraryItems.id),
+  strengthTemplateId: text("strength_template_id").references(() => strengthTemplates.id),
+  progressionTrackId: text("progression_track_id").references(() => progressionTracks.id),
+  locationId: text("location_id").references(() => trainingLocations.id),
+  priorityEmphasis: text("priority_emphasis").notNull().default("balanced"),
+  category: text("category").notNull().default("hard"),
+  workoutKind: text("workout_kind").notNull().default(""),
+  details: text("details").notNull().default(""),
+}, (table) => [uniqueIndex("programme_week_day_intent_unique").on(table.weekId, table.day)]);
+
 export const programmeWeekRecommendations = sqliteTable("programme_week_recommendations", {
   id: text("id").primaryKey(),
   weekId: text("week_id").notNull().references(() => plannedWeeks.id),

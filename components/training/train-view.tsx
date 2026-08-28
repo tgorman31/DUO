@@ -39,7 +39,7 @@ import type {
   StrengthSlot,
 } from "@/lib/app-types";
 import { CategoryBadge, EmptyState, formatDay, SectionHeading } from "./common";
-import { exerciseAvailable } from "@/lib/equipment";
+import { exerciseAvailable, resolveSessionLocationId } from "@/lib/equipment";
 
 type Navigate = (view: MainView, details?: Partial<AppRoute>, replace?: boolean) => void;
 type SetDraft = { weightKg: string; reps: string };
@@ -220,14 +220,16 @@ function formatLoad(value: number, convention: LoadConvention) {
 }
 
 function createExerciseDraft(data: AppData, slot: StrengthSlot, exerciseId = slot.selectedExerciseId): ExerciseDraft {
-  const previous = data.exerciseHistory.find((entry) => entry.athleteId === data.actor.id && entry.exerciseId === exerciseId);
-  const state = data.progress[data.actor.id]?.find((item) => item.exerciseId === exerciseId);
+  const historyExerciseId = data.v2.catalogue.find((exercise) => exercise.id === exerciseId)?.historyExerciseId ?? exerciseId;
+  const previous = data.exerciseHistory.find((entry) => entry.athleteId === data.actor.id && entry.exerciseId === historyExerciseId);
+  const state = data.progress[data.actor.id]?.find((item) => item.exerciseId === historyExerciseId);
   const load = state?.currentLoadKg ?? previous?.workingLoadKg;
   return { slotId: slot.id, exerciseId, workingLoad: load ? String(load) : "", sets: Array.from({ length: slot.workingSets }, () => ({ weightKg: load ? String(load) : "", reps: "" })), note: "" };
 }
 
 function StrengthLogger({ data, session, route, mutate, onNavigate, onDone }: { data: AppData; session: Session; route: AppRoute; mutate: Mutate; onNavigate: Navigate; onDone: () => void }) {
-  const sessionLocation = data.v2.locations.find((location) => location.id === session.locationId) ?? data.v2.locations.find((location) => location.id === data.v2.currentLocationId);
+  const resolvedLocationId = resolveSessionLocationId(session.locationId, data.v2.currentLocationId);
+  const sessionLocation = data.v2.locations.find((location) => location.id === resolvedLocationId);
   const availableEquipment = sessionLocation?.equipment ?? [];
   const definition = data.strengthDefinitions.find((item) => item.workoutKind === session.workoutKind) ?? (() => {
     const template = session.workout?.strengthTemplateId
