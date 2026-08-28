@@ -354,6 +354,7 @@ async function loadAppData(
           workoutKind: athleteSessions.workoutKind,
           details: athleteSessions.details,
           workoutTemplateId: athleteSessions.workoutTemplateId,
+          locationId: athleteSessions.locationId,
           assignment: athleteSessions.assignment,
           status: athleteSessions.status,
           completedAt: athleteSessions.completedAt,
@@ -703,10 +704,14 @@ async function loadAppData(
       today,
     ),
   }));
-  const weekWithState = weeksWithState.find((item) => item.id === week.id) ?? {
+  const baseWeekWithState = weeksWithState.find((item) => item.id === week.id) ?? {
     ...week,
     planningState: planningStateFor(week, sessionRows, today),
   };
+  const weekRecommendation = recommendationRowsV2.find((item) => item.weekId === week.id);
+  const weekWithState = !baseWeekWithState.confirmedAt && weekRecommendation
+    ? { ...baseWeekWithState, title: weekRecommendation.title || baseWeekWithState.title, rationale: weekRecommendation.rationale || baseWeekWithState.rationale, qualityFocus: weekRecommendation.qualityIntent || baseWeekWithState.qualityFocus, programmeWeekTypeId: weekRecommendation.weekTypeId, programmePhaseId: weekRecommendation.phaseId }
+    : baseWeekWithState;
   const eventData = eventRows.map((event) => ({
     ...event,
     daysAway: daysBetween(today, event.eventDate),
@@ -923,11 +928,15 @@ export async function POST(request: Request) {
       const weekId = asString(body.weekId);
       const [week] = await db.select().from(plannedWeeks).where(eq(plannedWeeks.id, weekId)).limit(1);
       if (!week) return apiError("Week not found.", 404);
+      const recommendation = await db.select().from(programmeWeekRecommendations).where(eq(programmeWeekRecommendations.weekId, weekId)).limit(1).then((rows) => rows[0]);
+      const intents = recommendation?.weekTypeId
+        ? await db.select().from(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, recommendation.weekTypeId)).orderBy(asc(weekTypeDayIntents.day))
+        : [];
       await reconcileRecommendedWeek(db, week, true);
       const confirmedAt = nowIso();
       await db
         .update(plannedWeeks)
-        .set({ confirmedAt, status: "set", updatedAt: confirmedAt })
+        .set({ confirmedAt, status: "set", programmeWeekTypeId: recommendation?.weekTypeId ?? week.programmeWeekTypeId, programmePhaseId: recommendation?.phaseId ?? week.programmePhaseId, programmeSnapshotJson: JSON.stringify({ recommendation: recommendation ?? null, intents, capturedAt: confirmedAt }) , updatedAt: confirmedAt })
         .where(eq(plannedWeeks.id, weekId));
       await recordPlanHistory(db, {
         weekId,
@@ -1576,15 +1585,43 @@ export async function POST(request: Request) {
               };
             })
             .filter((set) => set.weightKg >= 0 && set.reps > 0);
-          if (!slotId || !exerciseId || !parsedSets.length) continue;
+          if (!slotId || !exerciseId || !parsedSets.length) return apiError("Each strength entry needs a slot, exercise, and at least one completed set.");
 
-          const [slot, exercise, existingState, exerciseSetting] = await Promise.all([
-            db.select().from(strengthSlots).where(eq(strengthSlots.id, slotId)).limit(1).then((rows) => rows[0]),
-            db.select().from(exercises).where(eq(exercises.id, exerciseId)).limit(1).then((rows) => rows[0]),
+          // V2 builders submit catalogue exercise/focus-slot ids while V1
+          // history tables remain the canonical progression ledger. Resolve
+          // both ids explicitly; never silently drop a valid V2 entry.
+          const historySlotId = slotId;
+          let [slot] = await db.select().from(strengthSlots).where(eq(strengthSlots.id, slotId)).limit(1);
+          if (!slot) {
+            const [v2Slot] = await db.select().from(strengthFocusSlots).where(eq(strengthFocusSlots.id, slotId)).limit(1);
+            if (v2Slot) {
+              const linkedTemplate = await db.select().from(strengthTemplates).where(eq(strengthTemplates.id, v2Slot.templateId)).limit(1).then((rows) => rows[0]);
+              const numbers = v2Slot.prescription.match(/(\d+)\s*[×x]\s*(\d+)(?:\s*[–-]\s*(\d+))?/i);
+              const compatibility = { id: slotId, workoutKind: linkedTemplate?.name.toLowerCase().includes("strength b") ? "strength-b" : "strength-a", sortOrder: v2Slot.sortOrder, trainingGoal: "V2 Training Focus", defaultExerciseId: "", workingSets: numbers ? Number(numbers[1]) : 3, repLow: numbers ? Number(numbers[2]) : 8, repHigh: numbers ? Number(numbers[3] ?? numbers[2]) : 10 };
+              await db.insert(strengthSlots).values(compatibility).onConflictDoNothing();
+              [slot] = await db.select().from(strengthSlots).where(eq(strengthSlots.id, historySlotId)).limit(1);
+            }
+          }
+          if (!slot) return apiError(`Unknown strength slot: ${slotId}. Refresh the workout and try again.`, 422);
+
+          let historyExerciseId = exerciseId;
+          let [exercise] = await db.select().from(exercises).where(eq(exercises.id, exerciseId)).limit(1);
+          if (!exercise) {
+            const [catalogue] = await db.select().from(catalogueExercises).where(eq(catalogueExercises.id, exerciseId)).limit(1);
+            if (catalogue) {
+              historyExerciseId = catalogue.legacyExerciseId ?? `catalogue-${catalogue.id}`;
+              [exercise] = await db.select().from(exercises).where(eq(exercises.id, historyExerciseId)).limit(1);
+            }
+          }
+          if (!exercise) return apiError(`Unknown strength exercise: ${exerciseId}. Refresh the workout and try again.`, 422);
+
+          const [resolvedSlot, resolvedExercise, existingState, exerciseSetting] = await Promise.all([
+            Promise.resolve(slot),
+            Promise.resolve(exercise),
             db
               .select()
               .from(progressionStates)
-              .where(and(eq(progressionStates.athleteId, actor.id), eq(progressionStates.exerciseId, exerciseId)))
+              .where(and(eq(progressionStates.athleteId, actor.id), eq(progressionStates.exerciseId, historyExerciseId)))
               .limit(1)
               .then((rows) => rows[0]),
             db
@@ -1593,21 +1630,24 @@ export async function POST(request: Request) {
               .where(
                 and(
                   eq(athleteExerciseSettings.athleteId, actor.id),
-                  eq(athleteExerciseSettings.exerciseId, exerciseId),
+                  eq(athleteExerciseSettings.exerciseId, historyExerciseId),
                 ),
               )
               .limit(1)
               .then((rows) => rows[0]),
           ]);
-          if (!slot || !exercise) continue;
+          slot = resolvedSlot;
+          exercise = resolvedExercise;
+          if (!slot || !exercise) return apiError("Unable to resolve the submitted strength entry.", 422);
+          const resolvedExerciseId = historyExerciseId;
           const workingLoadKg = Math.max(...parsedSets.map((set) => set.weightKg));
           const performanceId = `performance-${resultId}-${slotId}`;
           await db.insert(exercisePerformances).values({
             id: performanceId,
             resultId,
             athleteId: actor.id,
-            exerciseId,
-            slotId,
+            exerciseId: resolvedExerciseId,
+            slotId: historySlotId,
             workingLoadKg,
             note,
             performedAt: completedDate,
@@ -1652,7 +1692,7 @@ export async function POST(request: Request) {
             .insert(progressionStates)
             .values({
               athleteId: actor.id,
-              exerciseId,
+              exerciseId: resolvedExerciseId,
               currentLoadKg,
               recommendedLoadKg,
               lastPerformanceId: performanceId,
@@ -1919,6 +1959,19 @@ export async function POST(request: Request) {
       return Response.json({ ok: true });
     }
 
+    if (action === "setSessionLocation") {
+      const sessionId = asString(body.sessionId);
+      const locationId = asString(body.locationId);
+      const [session] = await db.select().from(athleteSessions).where(and(eq(athleteSessions.id, sessionId), eq(athleteSessions.athleteId, actor.id))).limit(1);
+      if (!session) return apiError("Session not found.", 404);
+      if (locationId) {
+        const [location] = await db.select().from(trainingLocations).where(and(eq(trainingLocations.id, locationId), eq(trainingLocations.teamId, TEAM_ID), eq(trainingLocations.active, true))).limit(1);
+        if (!location) return apiError("Choose an active team location.");
+      }
+      await db.update(athleteSessions).set({ locationId: locationId || null, updatedAt: nowIso() }).where(eq(athleteSessions.id, sessionId));
+      return Response.json({ ok: true });
+    }
+
     if (action === "saveLocation") {
       const locationId = asString(body.locationId);
       const name = asString(body.name);
@@ -1980,10 +2033,12 @@ export async function POST(request: Request) {
       const name = asString(body.name);
       const slots = Array.isArray(body.slots) ? body.slots : [];
       if (!name) return apiError("Strength template name is required.");
-      const id = templateId || `strength-template-${crypto.randomUUID()}`;
-      const existing = templateId ? await db.select().from(strengthTemplates).where(eq(strengthTemplates.id, templateId)).limit(1).then((rows) => rows[0]) : null;
-      if (existing) await db.update(strengthTemplates).set({ name, purpose: asString(body.purpose), updatedAt: nowIso() }).where(eq(strengthTemplates.id, id));
-      else await db.insert(strengthTemplates).values({ id, teamId: TEAM_ID, name, purpose: asString(body.purpose), isBuiltIn: false, active: true, updatedAt: nowIso() });
+      const sourceId = templateId;
+      const existing = sourceId ? await db.select().from(strengthTemplates).where(eq(strengthTemplates.id, sourceId)).limit(1).then((rows) => rows[0]) : null;
+      const cloneBuiltIn = Boolean(existing?.isBuiltIn && body.editBuiltIn !== true);
+      const id = cloneBuiltIn || !sourceId ? `strength-template-${crypto.randomUUID()}` : sourceId;
+      if (existing && !cloneBuiltIn) await db.update(strengthTemplates).set({ name, purpose: asString(body.purpose), updatedAt: nowIso() }).where(eq(strengthTemplates.id, id));
+      else if (!existing || cloneBuiltIn) await db.insert(strengthTemplates).values({ id, teamId: TEAM_ID, name, purpose: asString(body.purpose), isBuiltIn: false, baseTemplateId: cloneBuiltIn ? sourceId : null, active: true, updatedAt: nowIso() });
       await db.delete(strengthFocusSlots).where(eq(strengthFocusSlots.templateId, id));
       const slotRows = slots.map((slot, index) => {
         const row = (slot ?? {}) as Record<string, unknown>;
@@ -1992,6 +2047,16 @@ export async function POST(request: Request) {
       for (const batch of d1InsertBatches(slotRows)) await db.insert(strengthFocusSlots).values(batch);
       await createActivity(db, actor.id, "workout", `${actor.displayName} saved ${name} in the Strength Builder.`, id);
       return Response.json({ ok: true, templateId: id });
+    }
+
+    if (action === "resetStrengthTemplate") {
+      const templateId = asString(body.templateId);
+      const [template] = await db.select().from(strengthTemplates).where(and(eq(strengthTemplates.id, templateId), eq(strengthTemplates.isBuiltIn, true))).limit(1);
+      if (!template) return apiError("Only a built-in Strength A/B template can be reset.", 404);
+      const baseSlots = JSON.parse(template.baseJson || "[]") as Array<Record<string, unknown>>;
+      await db.delete(strengthFocusSlots).where(eq(strengthFocusSlots.templateId, templateId));
+      for (const [index, slot] of baseSlots.entries()) await db.insert(strengthFocusSlots).values({ id: asString(slot.id, `${templateId}-slot-${index}`), templateId, focusId: asString(slot.focusId), exerciseId: asString(slot.exerciseId) || null, prescription: asString(slot.prescription), sortOrder: index, notes: asString(slot.notes) });
+      return Response.json({ ok: true, templateId });
     }
 
     if (action === "saveProgressionTrack") {
@@ -2024,7 +2089,8 @@ export async function POST(request: Request) {
       if (!week) return apiError("Programme week not found.", 404);
       if (week.confirmedAt || week.status === "in_progress") return apiError("Set or in-progress weeks require normal Week editing.", 409);
       const recommendation = { title: asString(body.title, week.title), rationale: asString(body.rationale, week.rationale), qualityIntent: asString(body.qualityIntent, week.qualityFocus), weekTypeId: asString(body.weekTypeId) || null, phaseId: asString(body.phaseId) || null, progressionTrackId: asString(body.progressionTrackId) || null };
-      await db.update(plannedWeeks).set({ title: recommendation.title, rationale: recommendation.rationale, qualityFocus: recommendation.qualityIntent, programmeWeekTypeId: recommendation.weekTypeId, programmePhaseId: recommendation.phaseId, updatedAt: nowIso() }).where(eq(plannedWeeks.id, weekId));
+      const legacyWeekType = recommendation.weekTypeId?.startsWith("week-type-") ? recommendation.weekTypeId.slice("week-type-".length) : week.weekType;
+      await db.update(plannedWeeks).set({ title: recommendation.title, rationale: recommendation.rationale, qualityFocus: recommendation.qualityIntent, weekType: legacyWeekType, programmeWeekTypeId: recommendation.weekTypeId, programmePhaseId: recommendation.phaseId, updatedAt: nowIso() }).where(eq(plannedWeeks.id, weekId));
       await db.insert(programmeWeekRecommendations).values({ id: `programme-recommendation-${weekId}`, weekId, ...recommendation, updatedAt: nowIso() }).onConflictDoUpdate({ target: programmeWeekRecommendations.weekId, set: { ...recommendation, updatedAt: nowIso() } });
       return Response.json({ ok: true });
     }

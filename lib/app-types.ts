@@ -70,6 +70,7 @@ export type Session = {
   workoutKind: string;
   details: string;
   workoutTemplateId: string | null;
+  locationId: string | null;
   assignment: string;
   status: string;
   completedAt: string | null;

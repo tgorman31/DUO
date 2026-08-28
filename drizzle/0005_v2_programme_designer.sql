@@ -73,7 +73,7 @@ CREATE TABLE `athlete_hyrox_priorities` (`athlete_id` text NOT NULL REFERENCES `
 --> statement-breakpoint
 CREATE UNIQUE INDEX `athlete_hyrox_station_unique` ON `athlete_hyrox_priorities` (`athlete_id`, `station`);
 --> statement-breakpoint
-CREATE TABLE `strength_templates` (`id` text PRIMARY KEY NOT NULL, `team_id` text NOT NULL REFERENCES `training_teams`(`id`), `name` text NOT NULL, `purpose` text DEFAULT '' NOT NULL, `is_built_in` integer DEFAULT false NOT NULL, `base_template_id` text, `active` integer DEFAULT true NOT NULL, `created_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL, `updated_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL);
+CREATE TABLE `strength_templates` (`id` text PRIMARY KEY NOT NULL, `team_id` text NOT NULL REFERENCES `training_teams`(`id`), `name` text NOT NULL, `purpose` text DEFAULT '' NOT NULL, `is_built_in` integer DEFAULT false NOT NULL, `base_template_id` text, `base_json` text DEFAULT '{}' NOT NULL, `active` integer DEFAULT true NOT NULL, `created_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL, `updated_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL);
 --> statement-breakpoint
 CREATE INDEX `strength_templates_team_idx` ON `strength_templates` (`team_id`);
 --> statement-breakpoint
@@ -108,3 +108,7 @@ ALTER TABLE `planned_weeks` ADD `programme_week_type_id` text REFERENCES week_ty
 ALTER TABLE `planned_weeks` ADD `programme_phase_id` text REFERENCES training_phases(id);
 --> statement-breakpoint
 ALTER TABLE `planned_weeks` ADD `programme_snapshot_json` text DEFAULT '{}' NOT NULL;
+--> statement-breakpoint
+ALTER TABLE `shared_sessions` ADD `location_id` text;
+--> statement-breakpoint
+ALTER TABLE `athlete_sessions` ADD `location_id` text;

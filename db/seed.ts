@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { eq, notInArray } from "drizzle-orm";
 import type { getDb } from ".";
 import {
   activityFeedItems,
@@ -83,13 +83,16 @@ export async function resetTrainingData(db: TrainingDb) {
   await db.delete(planHistoryItems);
   await db.delete(athleteSessions);
   await db.delete(sharedSessions);
+  await db.delete(programmeWeekRecommendations);
   await db.delete(plannedWeeks);
   await db.delete(events);
   await db.delete(trainingPhases);
   await db.delete(workoutFavourites);
   await db.delete(athleteHyroxPriorities);
   await db.delete(athleteCurrentLocations);
-  await db.delete(programmeWeekRecommendations);
+  await db.delete(exerciseFocusLinks);
+  await db.delete(focusHyroxRelationships);
+  await db.delete(trainingFocuses).where(eq(trainingFocuses.isBuiltIn, false));
   await db.delete(weekTypeDayIntents);
   await db.delete(weekTypeTemplates).where(eq(weekTypeTemplates.isBuiltIn, false));
   await db.delete(progressionStatesV2);
@@ -98,7 +101,7 @@ export async function resetTrainingData(db: TrainingDb) {
   await db.delete(strengthFocusSlots);
   await db.delete(strengthTemplates).where(eq(strengthTemplates.isBuiltIn, false));
   await db.delete(locationEquipment);
-  await db.delete(trainingLocations).where(eq(trainingLocations.active, false));
+  await db.delete(trainingLocations).where(notInArray(trainingLocations.id, ["location-building-gym", "location-perpetua", "location-everlast"]));
   await db.delete(workoutLibraryItems).where(eq(workoutLibraryItems.isBuiltIn, false));
   await db.delete(trainingBlocks);
   // The seed marker is intentionally removed so ensureSeeded rebuilds the
@@ -163,6 +166,23 @@ function focusIdForName(name: string) {
   return V2_TRAINING_FOCUSES.find((focus) => focus.name === name)?.id ?? null;
 }
 
+export const LEGACY_SLOT_FOCUS_MAP: Record<string, string> = {
+  "a-knee": "focus-heavy-knee",
+  "a-push": "focus-hpush",
+  "a-pull": "focus-vpull",
+  "a-unilateral": "focus-unilateral",
+  "a-hamstrings": "focus-ham-curl",
+  "a-calves": "focus-calf",
+  "a-grip": "focus-grip",
+  "b-lower": "focus-heavy-knee",
+  "b-row": "focus-hpull",
+  "b-shoulder": "focus-vpush",
+  "b-unilateral": "focus-unilateral",
+  "b-quads": "focus-quad-accessory",
+  "b-ski": "focus-vpull",
+  "b-core": "focus-trunk",
+};
+
 /** Additive, idempotent V2 catalogue/programme seed. It deliberately keeps
  * legacy `exercises` rows as the source of existing history and records a
  * deterministic catalogue-to-legacy alias where names match. */
@@ -221,6 +241,29 @@ async function ensureV2Data(db: TrainingDb) {
   }));
   for (const batch of d1InsertBatches(catalogueRows)) await db.insert(catalogueExercises).values(batch).onConflictDoNothing();
 
+  // Every V2 exercise receives a stable history-compatible legacy row. Exact
+  // aliases reuse the existing V1 id; new catalogue exercises use a namespaced
+  // compatibility id so completeStrength never has to drop valid entries.
+  const compatibilityExercises = V2_EXERCISE_CATALOGUE.map((exercise) => ({
+    id: legacyByName.get(exercise.name.toLowerCase()) ?? `catalogue-${exercise.id}`,
+    name: exercise.name,
+    trainingGoal: exercise.trainingFocus,
+    defaultIncrementKg: exercise.defaultIncrementKg ?? 2.5,
+    loadConvention: exercise.loadConvention,
+    isAccessory: /accessory|curl|raise|calf|plank/i.test(exercise.trainingFocus),
+    hyroxCarryoverJson: JSON.stringify(exercise.helpsWith.split(";").map((item) => item.trim()).filter(Boolean)),
+    catalogueId: exercise.id,
+  }));
+  for (const batch of d1InsertBatches(compatibilityExercises)) await db.insert(exercises).values(batch).onConflictDoNothing();
+  // Existing V1 rows are reused by normalized name where possible. Backfill
+  // the stable catalogue link on those rows without touching any user history
+  // or custom settings, so old IDs remain the canonical history IDs.
+  for (const exercise of compatibilityExercises) {
+    await db.update(exercises)
+      .set({ catalogueId: exercise.catalogueId })
+      .where(eq(exercises.id, exercise.id));
+  }
+
   const links = V2_EXERCISE_CATALOGUE.flatMap((exercise) => {
     const primary = focusIdForName(exercise.trainingFocus);
     const secondary = exercise.secondaryFocus ? focusIdForName(exercise.secondaryFocus) : null;
@@ -243,11 +286,15 @@ async function ensureV2Data(db: TrainingDb) {
     { id: "location-everlast", teamId: TEAM_ID, name: "Everlast Performance Centre", notes: "Race-specific HYROX equipment", active: true, updatedAt: now },
   ];
   for (const batch of d1InsertBatches(locationRows)) await db.insert(trainingLocations).values(batch).onConflictDoNothing();
-  const equipment = new Set<string>([
-    "Smith Machine", "Dumbbell", "Leg Press Machine", "Leg Curl Machine", "Leg Extension Machine", "Cable Station", "Treadmill", "Barbell", "Bench", "SkiErg", "RowErg", "Sled", "Wall Balls", "Sandbag", "Farmer Carry Implements",
-    ...V2_EXERCISE_CATALOGUE.flatMap((exercise) => [exercise.primaryEquipment, exercise.secondaryEquipment]).filter((item) => item && item !== "None"),
-  ]);
-  const equipmentRows = ["location-building-gym", "location-perpetua", "location-everlast"].flatMap((locationId) => [...equipment].map((item) => ({ locationId, equipment: item })));
+  // Keep defaults grounded in the known DUO context. Locations are deliberately
+  // different: Building Gym is the normal machine/Smith gym, while Everlast
+  // carries the race-specific implements. Users can extend either inventory.
+  const inventories: Record<string, string[]> = {
+    "location-building-gym": ["Smith Machine", "Leg Press Machine", "Leg Curl Machine", "Leg Extension Machine", "Dumbbell", "Barbell", "Bench (Flat)", "Cable", "Treadmill", "Bodyweight"],
+    "location-perpetua": ["Treadmill", "Dumbbell", "Barbell", "Bench (Flat)", "SkiErg", "RowErg", "Bodyweight"],
+    "location-everlast": ["Smith Machine", "Leg Press Machine", "Leg Curl Machine", "Leg Extension Machine", "Dumbbell", "Barbell", "Bench (Flat)", "Cable", "Treadmill", "SkiErg", "RowErg", "Sled", "Wall Balls", "Sandbag", "Farmer Carry Handles", "Bodyweight"],
+  };
+  const equipmentRows = Object.entries(inventories).flatMap(([locationId, items]) => items.map((equipment) => ({ locationId, equipment })));
   for (const batch of d1InsertBatches(equipmentRows)) await db.insert(locationEquipment).values(batch).onConflictDoNothing();
   const currentLocations = ["thomas", "kt"].map((athleteId) => ({ athleteId, locationId: "location-building-gym", updatedAt: now }));
   for (const batch of d1InsertBatches(currentLocations)) await db.insert(athleteCurrentLocations).values(batch).onConflictDoNothing();
@@ -257,17 +304,38 @@ async function ensureV2Data(db: TrainingDb) {
     { id: "strength-template-b", teamId: TEAM_ID, name: "Strength B", purpose: "DUO base hinge / pull emphasis", isBuiltIn: true, baseTemplateId: null, active: true, updatedAt: now },
   ];
   for (const batch of d1InsertBatches(templates)) await db.insert(strengthTemplates).values(batch).onConflictDoNothing();
-  const slotRows = await db.select().from(strengthSlots);
-  const focusSlots = slotRows.map((slot) => ({
+  // The V2 compatibility rows mirror the legacy slots with a `v2-` prefix.
+  // They must not be treated as new source slots on subsequent/idempotent
+  // seed runs (otherwise v2-v2-* focus slots accumulate).
+  const slotRows = (await db.select().from(strengthSlots)).filter((slot) => !slot.id.startsWith("v2-"));
+  const focusSlots = slotRows.map((slot) => {
+    const focusId = LEGACY_SLOT_FOCUS_MAP[slot.id];
+    if (!focusId) throw new Error(`V2 seed validation: unmapped built-in strength slot ${slot.id}`);
+    return ({
     id: `v2-${slot.id}`,
     templateId: slot.workoutKind === "strength-a" ? "strength-template-a" : "strength-template-b",
-    focusId: focusIdForName(slot.trainingGoal) ?? "focus-heavy-knee",
+    focusId,
     exerciseId: V2_EXERCISE_CATALOGUE.find((exercise) => exercise.name.toLowerCase() === (legacyExercises.find((item) => item.id === slot.defaultExerciseId)?.name ?? "").toLowerCase())?.id ?? null,
     prescription: `${slot.workingSets} × ${slot.repLow}–${slot.repHigh}`,
     sortOrder: slot.sortOrder,
     notes: "DUO base slot; editable without changing exercise history",
-  }));
+  }); });
   for (const batch of d1InsertBatches(focusSlots)) await db.insert(strengthFocusSlots).values(batch).onConflictDoNothing();
+  for (const templateId of ["strength-template-a", "strength-template-b"]) {
+    const baseSlots = focusSlots.filter((slot) => slot.templateId === templateId);
+    await db.update(strengthTemplates).set({ baseJson: JSON.stringify(baseSlots), updatedAt: now }).where(eq(strengthTemplates.id, templateId));
+  }
+  const compatibilitySlots = slotRows.map((slot) => ({
+    id: `v2-${slot.id}`,
+    workoutKind: slot.workoutKind,
+    sortOrder: slot.sortOrder,
+    trainingGoal: V2_TRAINING_FOCUSES.find((focus) => focus.id === LEGACY_SLOT_FOCUS_MAP[slot.id])?.name ?? slot.trainingGoal,
+    defaultExerciseId: slot.defaultExerciseId,
+    workingSets: slot.workingSets,
+    repLow: slot.repLow,
+    repHigh: slot.repHigh,
+  }));
+  for (const batch of d1InsertBatches(compatibilitySlots)) await db.insert(strengthSlots).values(batch).onConflictDoNothing();
 
   const progressionSeeds = [
     { id: "track-lt2-running", name: "LT2 Running", purpose: "Build sustainable threshold running", steps: [["3 × 8 min", "3 × 8 min"], ["3 × 10 min", "3 × 10 min"], ["2 × 20 min", "2 × 20 min"], ["4 × 10 min", "4 × 10 min"]] },
@@ -285,7 +353,20 @@ async function ensureV2Data(db: TrainingDb) {
     id: `week-type-${id}`, teamId: TEAM_ID, name: info.label, rationale: info.rationale, hardTarget: info.targets.hard, strengthTarget: info.targets.strength, easyTarget: info.targets.easy, defaultLocationId: "location-building-gym", priorityEmphasis: "balanced", isBuiltIn: true, active: true, baseJson: JSON.stringify(info), updatedAt: now,
   }));
   for (const batch of d1InsertBatches(weekTypeRows)) await db.insert(weekTypeTemplates).values(batch).onConflictDoNothing();
-  const dayIntents = weekTypeRows.flatMap((weekType) => Array.from({ length: 7 }, (_, day) => ({ id: `${weekType.id}-${day}`, weekTypeId: weekType.id, day, intent: day === 0 ? "Hard Conditioning" : day === 2 ? "Strength" : day === 3 ? "Running Quality" : day === 5 ? "Easy Aerobic" : "Rest / Recovery", priorityEmphasis: "balanced" })));
+  const dayIntents = weekTypeRows.flatMap((weekType) => {
+    const key = weekType.id.replace("week-type-", "");
+    const schedule = scheduleForWeek({ id: `template-${key}`, weekType: key, qualityFocus: "" });
+    return schedule.map((item) => ({
+      id: `${weekType.id}-${item.day}`,
+      weekTypeId: weekType.id,
+      day: item.day,
+      intent: item.title,
+      workoutId: workoutTemplateIdForSession(item.title, item.workoutKind),
+      strengthTemplateId: item.workoutKind === "strength-a" ? "strength-template-a" : item.workoutKind === "strength-b" ? "strength-template-b" : null,
+      progressionTrackId: item.title.toLowerCase().includes("lt2") ? "track-lt2-running" : item.title.toLowerCase().includes("vo") ? "track-vo2-running" : item.title.toLowerCase().includes("compromised") ? "track-hyrox-compromised" : null,
+      priorityEmphasis: "balanced",
+    }))
+  });
   for (const batch of d1InsertBatches(dayIntents)) await db.insert(weekTypeDayIntents).values(batch).onConflictDoNothing();
   const weeks = await db.select().from(plannedWeeks);
   const phases = await db.select().from(trainingPhases);
@@ -409,7 +490,9 @@ export async function ensureSeeded(db: TrainingDb) {
 
   const alternativeSeedRows = Object.entries(SLOT_ALTERNATIVES).flatMap(
     ([slotId, exerciseIds]) =>
-      exerciseIds.map((exerciseId) => ({ slotId, exerciseId })),
+      exerciseIds
+        .filter((exerciseId) => !(slotId === "a-hamstrings" && exerciseId === "db-rdl"))
+        .map((exerciseId) => ({ slotId, exerciseId })),
   );
   for (const batch of d1InsertBatches(alternativeSeedRows)) {
     await db.insert(slotAlternatives).values(batch).onConflictDoNothing();
