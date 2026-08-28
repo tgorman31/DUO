@@ -2,7 +2,7 @@
 // Generated from DUO_HYROX_Exercise_Catalogue_v1.xlsx; the source workbook is intentionally not shipped.
 export type CatalogueTier = "Core" | "Useful" | "Niche";
 export type CatalogueExercise = {
-  id: string; name: string; sourceType: string; sourceRow: number | null; family: string; trainingFocus: string; secondaryFocus: string | null; tier: CatalogueTier; defaultVisibility: string; focusRank: number; difficulty: string; primaryEquipment: string; secondaryEquipment: string; bodyRegion: string; movementPattern: string; mechanics: string; laterality: string; primaryMuscleGroup: string; secondaryMuscleGroups: string; helpsWith: string; directHyrox: string; prescription: string; loadConvention: string; defaultIncrementKg: number | null; demoUrl: string | null; explanationUrl: string | null; whyDuoKeeps: string;
+  id: string; name: string; sourceType: string; sourceRow: number | null; family: string; trainingFocus: string; secondaryFocus: string | null; tier: CatalogueTier; defaultVisibility: string; focusRank: number; difficulty: string; primaryEquipment: string; secondaryEquipment: string | null; bodyRegion: string; movementPattern: string; mechanics: string; laterality: string; primaryMuscleGroup: string; secondaryMuscleGroups: string | null; helpsWith: string; directHyrox: string; prescription: string; loadConvention: string; defaultIncrementKg: number | null; demoUrl: string | null; explanationUrl: string | null; whyDuoKeeps: string;
 };
 export type TrainingFocusSeed = { id: string; name: string; purpose: string; defaultPrescription: string; primaryMuscles: string; sourcePatterns: string; hyroxLinks: string; programmingNotes: string };
 export type HyroxFocusRelationship = { focus: string; station: string; score: number };

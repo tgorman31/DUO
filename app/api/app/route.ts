@@ -740,9 +740,9 @@ async function loadAppData(
       defaultVisibility: exercise.defaultVisibility,
       focusRank: exercise.focusRank,
       primaryEquipment: exercise.primaryEquipment,
-      secondaryEquipment: exercise.secondaryEquipment,
+      secondaryEquipment: exercise.secondaryEquipment ?? "",
       primaryMuscleGroup: exercise.primaryMuscleGroup,
-      secondaryMuscleGroups: exercise.secondaryMuscleGroups,
+      secondaryMuscleGroups: exercise.secondaryMuscleGroups ?? "",
       helpsWith: parseJson<string[]>(exercise.helpsWithJson, []),
       directHyrox: exercise.directHyrox,
       prescription: exercise.prescription,
@@ -1975,13 +1975,10 @@ export async function POST(request: Request) {
     if (action === "saveLocation") {
       const locationId = asString(body.locationId);
       const name = asString(body.name);
-      const equipment = Array.isArray(body.equipment) ? [...new Set(body.equipment.filter((item): item is string => typeof item === "string" && item.trim()).map((item) => item.trim()))] : [];
+      const equipment = Array.isArray(body.equipment) ? [...new Set(body.equipment.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean))] : [];
       if (!name) return apiError("Location name is required.");
       const id = locationId || `location-${crypto.randomUUID()}`;
       const existing = locationId ? await db.select().from(trainingLocations).where(and(eq(trainingLocations.id, locationId), eq(trainingLocations.teamId, TEAM_ID))).limit(1).then((rows) => rows[0]) : null;
-      if (existing && existing.isBuiltIn && existing.name !== name) {
-        // Built-in locations are editable but remain non-destructively identified.
-      }
       if (existing) await db.update(trainingLocations).set({ name, notes: asString(body.notes), active: true, updatedAt: nowIso() }).where(eq(trainingLocations.id, id));
       else await db.insert(trainingLocations).values({ id, teamId: TEAM_ID, name, notes: asString(body.notes), active: true, updatedAt: nowIso() });
       await db.delete(locationEquipment).where(eq(locationEquipment.locationId, id));

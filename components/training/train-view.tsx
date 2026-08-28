@@ -245,7 +245,7 @@ function StrengthLogger({ data, session, route, mutate, onNavigate, onDone }: { 
             name: exercise.name,
             baseName: exercise.name,
             trainingGoal: focus?.name ?? "Training focus",
-            defaultIncrementKg: exercise.defaultIncrementKg ?? data.actor.loadIncrementKg,
+            defaultIncrementKg: exercise.defaultIncrementKg ?? data.actor.loadIncrementKg ?? 2.5,
             loadConvention: exercise.loadConvention as LoadConvention,
             isAccessory: /accessory|curl|raise|calf|plank/i.test(focus?.name ?? ""),
             hyroxCarryover: exercise.helpsWith,

@@ -97,7 +97,7 @@ export function ProgressView({ data, mutate, route, onNavigate, onBack }: { data
     const exposure = new Map<string, number>();
     for (const entry of data.exerciseHistory.filter((item) => item.athleteId === athleteId)) {
       const catalogue = data.v2.catalogue.find((exercise) => exercise.legacyExerciseId === entry.exerciseId || exercise.name.toLowerCase() === entry.exerciseName.toLowerCase());
-      const muscles = catalogue ? [catalogue.primaryMuscleGroup, ...catalogue.secondaryMuscleGroups.split(";").map((item) => item.trim())] : [];
+      const muscles = catalogue ? [catalogue.primaryMuscleGroup, ...(catalogue.secondaryMuscleGroups ?? "").split(";").map((item) => item.trim())] : [];
       for (const muscle of muscles.filter(Boolean)) exposure.set(muscle, Math.max(exposure.get(muscle) ?? 0, new Date(`${entry.performedAt}T00:00:00Z`).getTime()));
     }
     const meaningful = ["Chest", "Hamstrings", "Calves", "Quads", "Glutes", "Back", "Shoulders", "Triceps", "Core", "Grip / Forearms"];

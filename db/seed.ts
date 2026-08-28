@@ -219,7 +219,7 @@ async function ensureV2Data(db: TrainingDb) {
     focusRank: exercise.focusRank,
     difficulty: exercise.difficulty,
     primaryEquipment: exercise.primaryEquipment,
-    secondaryEquipment: exercise.secondaryEquipment,
+    secondaryEquipment: exercise.secondaryEquipment ?? "",
     bodyRegion: exercise.bodyRegion,
     movementPattern: exercise.movementPattern,
     mechanics: exercise.mechanics,
