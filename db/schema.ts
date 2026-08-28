@@ -333,6 +333,7 @@ export const strengthFocusSlots = sqliteTable("strength_focus_slots", {
   templateId: text("template_id").notNull().references(() => strengthTemplates.id),
   focusId: text("focus_id").notNull().references(() => trainingFocuses.id),
   exerciseId: text("exercise_id").references(() => catalogueExercises.id),
+  historySlotId: text("history_slot_id").references(() => strengthSlots.id),
   prescription: text("prescription").notNull().default(""),
   sortOrder: integer("sort_order").notNull().default(0),
   notes: text("notes").notNull().default(""),

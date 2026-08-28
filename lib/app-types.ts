@@ -167,6 +167,7 @@ export type ExerciseOption = {
   loadConvention: LoadConvention;
   isAccessory: boolean;
   hyroxCarryover: string[];
+  unavailable?: boolean;
 };
 
 export type StrengthSlot = {
@@ -310,6 +311,7 @@ export type V2CatalogueExercise = {
   demoUrl: string | null;
   explanationUrl: string | null;
   legacyExerciseId: string | null;
+  historyExerciseId: string | null;
 };
 
 export type TrainingLocation = {
@@ -324,8 +326,10 @@ export type StrengthBuilderSlot = {
   id: string;
   templateId: string;
   focusId: string;
+  historySlotId: string | null;
   focusName: string;
   exerciseId: string | null;
+  historyExerciseId?: string | null;
   exerciseName: string | null;
   prescription: string;
   sortOrder: number;

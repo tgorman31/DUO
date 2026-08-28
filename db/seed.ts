@@ -1,4 +1,4 @@
-import { eq, notInArray } from "drizzle-orm";
+import { and, eq, notInArray, sql } from "drizzle-orm";
 import type { getDb } from ".";
 import {
   activityFeedItems,
@@ -92,17 +92,20 @@ export async function resetTrainingData(db: TrainingDb) {
   await db.delete(athleteCurrentLocations);
   await db.delete(exerciseFocusLinks);
   await db.delete(focusHyroxRelationships);
+  await db.delete(strengthFocusSlots);
   await db.delete(trainingFocuses).where(eq(trainingFocuses.isBuiltIn, false));
   await db.delete(weekTypeDayIntents);
   await db.delete(weekTypeTemplates).where(eq(weekTypeTemplates.isBuiltIn, false));
   await db.delete(progressionStatesV2);
   await db.delete(progressionSteps);
   await db.delete(progressionTracks).where(eq(progressionTracks.isBuiltIn, false));
-  await db.delete(strengthFocusSlots);
+  // Library items may reference custom Strength templates; remove them before
+  // deleting the template/slot rows so factory reset remains FK-safe.
+  await db.delete(workoutLibraryItems).where(eq(workoutLibraryItems.isBuiltIn, false));
   await db.delete(strengthTemplates).where(eq(strengthTemplates.isBuiltIn, false));
+  await db.delete(strengthSlots).where(and(notInArray(strengthSlots.id, STRENGTH_SLOT_SEEDS.map(([id]) => id)), sql`id not like 'v2-%'`));
   await db.delete(locationEquipment);
   await db.delete(trainingLocations).where(notInArray(trainingLocations.id, ["location-building-gym", "location-perpetua", "location-everlast"]));
-  await db.delete(workoutLibraryItems).where(eq(workoutLibraryItems.isBuiltIn, false));
   await db.delete(trainingBlocks);
   // The seed marker is intentionally removed so ensureSeeded rebuilds the
   // initial block/events/programme on the next authenticated request.
@@ -308,23 +311,6 @@ async function ensureV2Data(db: TrainingDb) {
   // They must not be treated as new source slots on subsequent/idempotent
   // seed runs (otherwise v2-v2-* focus slots accumulate).
   const slotRows = (await db.select().from(strengthSlots)).filter((slot) => !slot.id.startsWith("v2-"));
-  const focusSlots = slotRows.map((slot) => {
-    const focusId = LEGACY_SLOT_FOCUS_MAP[slot.id];
-    if (!focusId) throw new Error(`V2 seed validation: unmapped built-in strength slot ${slot.id}`);
-    return ({
-    id: `v2-${slot.id}`,
-    templateId: slot.workoutKind === "strength-a" ? "strength-template-a" : "strength-template-b",
-    focusId,
-    exerciseId: V2_EXERCISE_CATALOGUE.find((exercise) => exercise.name.toLowerCase() === (legacyExercises.find((item) => item.id === slot.defaultExerciseId)?.name ?? "").toLowerCase())?.id ?? null,
-    prescription: `${slot.workingSets} × ${slot.repLow}–${slot.repHigh}`,
-    sortOrder: slot.sortOrder,
-    notes: "DUO base slot; editable without changing exercise history",
-  }); });
-  for (const batch of d1InsertBatches(focusSlots)) await db.insert(strengthFocusSlots).values(batch).onConflictDoNothing();
-  for (const templateId of ["strength-template-a", "strength-template-b"]) {
-    const baseSlots = focusSlots.filter((slot) => slot.templateId === templateId);
-    await db.update(strengthTemplates).set({ baseJson: JSON.stringify(baseSlots), updatedAt: now }).where(eq(strengthTemplates.id, templateId));
-  }
   const compatibilitySlots = slotRows.map((slot) => ({
     id: `v2-${slot.id}`,
     workoutKind: slot.workoutKind,
@@ -335,8 +321,27 @@ async function ensureV2Data(db: TrainingDb) {
     repLow: slot.repLow,
     repHigh: slot.repHigh,
   }));
+  // History slots are created before their V2 focus-slot wrappers so the
+  // explicit focus->history foreign key is valid on fresh and repeat seeds.
   for (const batch of d1InsertBatches(compatibilitySlots)) await db.insert(strengthSlots).values(batch).onConflictDoNothing();
-
+  const focusSlots = slotRows.map((slot) => {
+    const focusId = LEGACY_SLOT_FOCUS_MAP[slot.id];
+    if (!focusId) throw new Error(`V2 seed validation: unmapped built-in strength slot ${slot.id}`);
+    return ({
+    id: `v2-${slot.id}`,
+    templateId: slot.workoutKind === "strength-a" ? "strength-template-a" : "strength-template-b",
+    focusId,
+    exerciseId: V2_EXERCISE_CATALOGUE.find((exercise) => exercise.name.toLowerCase() === (legacyExercises.find((item) => item.id === slot.defaultExerciseId)?.name ?? "").toLowerCase())?.id ?? null,
+    historySlotId: `v2-${slot.id}`,
+    prescription: `${slot.workingSets} × ${slot.repLow}–${slot.repHigh}`,
+    sortOrder: slot.sortOrder,
+    notes: "DUO base slot; editable without changing exercise history",
+  }); });
+  for (const batch of d1InsertBatches(focusSlots)) await db.insert(strengthFocusSlots).values(batch).onConflictDoNothing();
+  for (const templateId of ["strength-template-a", "strength-template-b"]) {
+    const baseSlots = focusSlots.filter((slot) => slot.templateId === templateId);
+    await db.update(strengthTemplates).set({ baseJson: JSON.stringify(baseSlots), updatedAt: now }).where(eq(strengthTemplates.id, templateId));
+  }
   const progressionSeeds = [
     { id: "track-lt2-running", name: "LT2 Running", purpose: "Build sustainable threshold running", steps: [["3 × 8 min", "3 × 8 min"], ["3 × 10 min", "3 × 10 min"], ["2 × 20 min", "2 × 20 min"], ["4 × 10 min", "4 × 10 min"]] },
     { id: "track-vo2-running", name: "VO₂ Running", purpose: "Develop repeatable faster running", steps: [["8 × 2 min", "8 × 2 min"], ["6 × 3 min", "6 × 3 min"]] },
@@ -488,10 +493,12 @@ export async function ensureSeeded(db: TrainingDb) {
     await db.insert(strengthSlots).values(batch).onConflictDoNothing();
   }
 
+  const hamstringRdlIds = new Set(exerciseSeedRows.filter((exercise) => /rdl|romanian deadlift|hip hinge/i.test(exercise.name)).map((exercise) => exercise.id));
+  for (const exerciseId of hamstringRdlIds) await db.delete(slotAlternatives).where(and(eq(slotAlternatives.slotId, "a-hamstrings"), eq(slotAlternatives.exerciseId, exerciseId)));
   const alternativeSeedRows = Object.entries(SLOT_ALTERNATIVES).flatMap(
     ([slotId, exerciseIds]) =>
       exerciseIds
-        .filter((exerciseId) => !(slotId === "a-hamstrings" && exerciseId === "db-rdl"))
+        .filter((exerciseId) => !(slotId === "a-hamstrings" && (exerciseId === "db-rdl" || hamstringRdlIds.has(exerciseId))))
         .map((exerciseId) => ({ slotId, exerciseId })),
   );
   for (const batch of d1InsertBatches(alternativeSeedRows)) {

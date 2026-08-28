@@ -39,6 +39,7 @@ import type {
   StrengthSlot,
 } from "@/lib/app-types";
 import { CategoryBadge, EmptyState, formatDay, SectionHeading } from "./common";
+import { exerciseAvailable } from "@/lib/equipment";
 
 type Navigate = (view: MainView, details?: Partial<AppRoute>, replace?: boolean) => void;
 type SetDraft = { weightKg: string; reps: string };
@@ -226,6 +227,8 @@ function createExerciseDraft(data: AppData, slot: StrengthSlot, exerciseId = slo
 }
 
 function StrengthLogger({ data, session, route, mutate, onNavigate, onDone }: { data: AppData; session: Session; route: AppRoute; mutate: Mutate; onNavigate: Navigate; onDone: () => void }) {
+  const sessionLocation = data.v2.locations.find((location) => location.id === session.locationId) ?? data.v2.locations.find((location) => location.id === data.v2.currentLocationId);
+  const availableEquipment = sessionLocation?.equipment ?? [];
   const definition = data.strengthDefinitions.find((item) => item.workoutKind === session.workoutKind) ?? (() => {
     const template = session.workout?.strengthTemplateId
       ? data.v2.strengthTemplates.find((item) => item.id === session.workout?.strengthTemplateId)
@@ -236,8 +239,8 @@ function StrengthLogger({ data, session, route, mutate, onNavigate, onDone }: { 
       label: session.workout?.name ?? template.name,
       slots: template.slots.map((slot) => {
         const focus = data.v2.trainingFocuses.find((item) => item.id === slot.focusId);
-        const options = data.v2.catalogue
-          .filter((exercise) => exercise.trainingFocus === focus?.name)
+        const options: ExerciseOption[] = data.v2.catalogue
+          .filter((exercise) => exercise.trainingFocus === focus?.name && exerciseAvailable(exercise.primaryEquipment, exercise.secondaryEquipment, availableEquipment))
           .sort((a, b) => a.focusRank - b.focusRank)
           .map((exercise) => ({
             slotId: slot.id,
@@ -250,6 +253,21 @@ function StrengthLogger({ data, session, route, mutate, onNavigate, onDone }: { 
             isAccessory: /accessory|curl|raise|calf|plank/i.test(focus?.name ?? ""),
             hyroxCarryover: exercise.helpsWith,
           }));
+        const programmed = slot.exerciseId ? data.v2.catalogue.find((exercise) => exercise.id === slot.exerciseId) : null;
+        if (programmed && !options.some((option) => option.exerciseId === programmed.id)) {
+          options.unshift({
+            slotId: slot.id,
+            exerciseId: programmed.id,
+            name: programmed.name,
+            baseName: programmed.name,
+            trainingGoal: focus?.name ?? "Training focus",
+            defaultIncrementKg: programmed.defaultIncrementKg ?? data.actor.loadIncrementKg ?? 2.5,
+            loadConvention: programmed.loadConvention as LoadConvention,
+            isAccessory: false,
+            hyroxCarryover: programmed.helpsWith,
+            unavailable: true,
+          });
+        }
         const selected = slot.exerciseId ?? options[0]?.exerciseId ?? "";
         const prescription = slot.prescription || focus?.defaultPrescription || "3 × 8–10";
         const numbers = prescription.match(/(\d+)\s*[×x]\s*(\d+)(?:\s*[–-]\s*(\d+))?/i);
@@ -289,8 +307,9 @@ function StrengthLogger({ data, session, route, mutate, onNavigate, onDone }: { 
   if (!definition) return <EmptyState title="Strength template unavailable" description="This session is not linked to Strength A or Strength B." />;
   const slot = definition.slots[index]; const draft = drafts[slot.id] ?? createExerciseDraft(data, slot);
   const option = slot.options.find((item) => item.exerciseId === draft.exerciseId) ?? slot.options[0]; const convention = option?.loadConvention ?? "total_load";
-  const previous = data.exerciseHistory.find((entry) => entry.athleteId === data.actor.id && entry.exerciseId === draft.exerciseId);
-  const progression = data.progress[data.actor.id]?.find((item) => item.exerciseId === draft.exerciseId);
+  const historyExerciseId = data.v2.catalogue.find((exercise) => exercise.id === draft.exerciseId)?.historyExerciseId ?? draft.exerciseId;
+  const previous = data.exerciseHistory.find((entry) => entry.athleteId === data.actor.id && entry.exerciseId === historyExerciseId);
+  const progression = data.progress[data.actor.id]?.find((item) => item.exerciseId === historyExerciseId);
   const workingWeight = Number(draft.workingLoad || 0); const warmups = option ? warmupsFor(workingWeight, option) : [];
   const updateDraft = (updates: Partial<ExerciseDraft>) => setDrafts((current) => ({ ...current, [slot.id]: { ...draft, ...updates } }));
   const updateWorkingLoad = (value: string) => updateDraft({ workingLoad: value, sets: draft.sets.map((set) => ({ ...set, weightKg: value })) });
@@ -298,7 +317,18 @@ function StrengthLogger({ data, session, route, mutate, onNavigate, onDone }: { 
   const updateSet = (setIndex: number, key: keyof SetDraft, value: string) => updateDraft({ sets: draft.sets.map((set, itemIndex) => itemIndex === setIndex ? { ...set, [key]: value } : set) });
   const moveTo = (nextIndex: number) => { const bounded = Math.max(0, Math.min(definition.slots.length - 1, nextIndex)); setIndex(bounded); onNavigate("train", { sessionId: session.id, mode: "log", exerciseId: definition.slots[bounded].id }, true); window.scrollTo({ top: 0, behavior: "smooth" }); };
   const complete = async () => {
-    const entries = definition.slots.map((item) => drafts[item.id]).filter(Boolean).map((item) => ({ slotId: item.slotId, exerciseId: item.exerciseId, note: item.note, sets: item.sets.filter((set) => Number(set.reps) > 0).map((set) => ({ weightKg: Number(set.weightKg || 0), reps: Number(set.reps) })) })).filter((entry) => entry.sets.length > 0);
+    const entries = definition.slots
+      .map((item) => drafts[item.id])
+      .filter(Boolean)
+      .map((item) => ({
+        slotId: item.slotId,
+        exerciseId: data.v2.catalogue.find((exercise) => exercise.id === item.exerciseId)?.historyExerciseId ?? item.exerciseId,
+        note: item.note,
+        sets: item.sets
+          .filter((set) => Number(set.reps) > 0)
+          .map((set) => ({ weightKg: Number(set.weightKg || 0), reps: Number(set.reps) })),
+      }))
+      .filter((entry) => entry.sets.length > 0);
     await mutate({ action: "completeStrength", sessionId: session.id, completedDate, rpe, feel, notes: sessionNotes, exercises: entries }, `${definition.label} completed and progression updated`);
     window.localStorage.removeItem(draftKey); onDone();
   };
@@ -310,7 +340,7 @@ function StrengthLogger({ data, session, route, mutate, onNavigate, onDone }: { 
       <div className="exercise-panel">
         <aside className="exercise-context-panel" aria-label="Exercise context">
           <h3>Exercise context</h3>
-          <div className="exercise-goal-row"><div><span>Training goal</span><strong>{slot.trainingGoal}</strong>{option?.hyroxCarryover?.length ? <div className="hyrox-carryover"><span>Helps with</span><div>{option.hyroxCarryover.map((item) => <span key={item}>{item}</span>)}</div></div> : null}</div><div className="exercise-prescription"><span>Prescription</span><strong>{slot.workingSets} × {slot.repLow}–{slot.repHigh}</strong></div></div>
+          <div className="exercise-goal-row"><div><span>Training goal</span><strong>{slot.trainingGoal}</strong>{option?.hyroxCarryover?.length ? <div className="hyrox-carryover"><span>Helps with</span><div>{option.hyroxCarryover.map((item) => <span key={item}>{item}</span>)}</div></div> : null}{option?.unavailable ? <small className="warning-text">Unavailable at {sessionLocation?.name ?? "this location"}. Choose an available alternative.</small> : null}</div><div className="exercise-prescription"><span>Prescription</span><strong>{slot.workingSets} × {slot.repLow}–{slot.repHigh}</strong></div></div>
         </aside>
         <div className="exercise-main-column">
           <div className="field-stack"><Label htmlFor="exercise-choice">Exercise</Label><Select value={draft.exerciseId} onValueChange={changeExercise}><SelectTrigger id="exercise-choice" className="full-select exercise-select"><SelectValue /></SelectTrigger><SelectContent>{slot.options.map((item) => <SelectItem value={item.exerciseId} key={item.exerciseId}>{item.name}</SelectItem>)}</SelectContent></Select></div>
@@ -353,23 +383,18 @@ export function TrainView({ data, mutate, route, onNavigate }: { data: AppData; 
   }
 
   if (route.mode === "log" && selected) {
-    const structuredStrength = selected.workoutKind === "strength-a" || selected.workoutKind === "strength-b" || selected.workout?.family.toLowerCase() === "strength";
+    const structuredStrength = selected.workoutKind.startsWith("strength-") || selected.workout?.family.toLowerCase() === "strength";
     return <div className="view-stack">{structuredStrength ? <StrengthLogger key={selected.id} data={data} session={selected} route={route} mutate={mutate} onNavigate={onNavigate} onDone={() => onNavigate("train", { sessionId: selected.id }, true)} /> : <><Prescription workout={selected.workout} fallback={selected.details} /><WorkoutLogger session={selected} data={data} mutate={mutate} onDone={() => onNavigate("train", { sessionId: selected.id }, true)} /></>}</div>;
   }
   if (!selected) return <div className="view-stack">{todayRest ? <section className="rest-status-card"><Moon /><div><p className="eyebrow">Today</p><h1>Rest / Recovery</h1><p>No structured training planned today.</p></div></section> : null}<EmptyState title="No workout planned" description="Add a session in Week, then return here to train." action={<Button onClick={() => onNavigate("week")}>Add training</Button>} /></div>;
 
   const upcoming = actualSessions.filter((session) => session.status === "planned");
-  const coverage = selected.workout
-    ? data.v2.catalogue.find((exercise) => exercise.name.toLowerCase() === selected.workout?.name.toLowerCase())?.helpsWith ?? []
-    : [];
-  const priorityStations = new Set((data.v2.priorities[data.actor.id] ?? []).slice(0, 3));
   return (
     <div className="view-stack">
       {todayRest ? <section className="rest-status-card"><Moon aria-hidden="true" /><div><p className="eyebrow">Today</p><h2>Rest / Recovery</h2><p>No structured training planned today.</p><span>Next training: {formatDay(selected.scheduledDate)} — {selected.title}</span></div><Button variant="outline" size="sm" onClick={() => mutate({ action: "markRestComplete", sessionId: todayRest.id }, "Recovery day marked complete")}>Mark day complete</Button></section> : null}
       <section className="train-hero train-overview-hero"><div className="train-hero-icon"><Gauge aria-hidden="true" /></div><p className="eyebrow">Workout overview</p><h1>{selected.title}</h1><p>{selected.workout?.purpose || selected.details}</p><div className="train-hero-meta"><CategoryBadge category={selected.category} /><span><Timer aria-hidden="true" /> {formatDay(selected.scheduledDate)}</span></div></section>
       <section className="performance-card session-location-card"><div className="field-stack"><Label htmlFor="session-location">Session location override <span className="optional-label">Optional</span></Label><Select value={selected.locationId ?? "default"} onValueChange={(value) => void mutate({ action: "setSessionLocation", sessionId: selected.id, locationId: value === "default" ? "" : value }, "Session location updated")}><SelectTrigger id="session-location" className="full-select"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="default">Use current location ({data.v2.locations.find((location) => location.id === data.v2.currentLocationId)?.name ?? "none selected"})</SelectItem>{data.v2.locations.map((location) => <SelectItem key={location.id} value={location.id}>{location.name}</SelectItem>)}</SelectContent></Select></div></section>
       {selected.status === "completed" ? <div className="completed-banner"><Check /> Completed · RPE {selected.rpe ?? "—"}</div> : <section className="workout-start-actions"><Button className="start-session-button" onClick={() => onNavigate("train", { sessionId: selected.id, mode: "log" })}>Open workout <ArrowRight /></Button></section>}
-      {coverage.length ? <section className="performance-card hyrox-coverage-card"><SectionHeading eyebrow="Informational context" title="HYROX areas hit" /><div className="coverage-chip-list">{coverage.map((station) => <span key={station}>{station}{priorityStations.has(station) ? <strong> · {data.actor.displayName.slice(0, 2).toUpperCase()} priority</strong> : null}</span>)}</div><small>Supporting strength is not the same as direct station practice.</small></section> : null}
       <section className="performance-card training-queue-card"><SectionHeading eyebrow="Your individual plan" title="Training queue" /><Select value={selected.id} onValueChange={(value) => onNavigate("train", { sessionId: value, mode: "log" })}><SelectTrigger className="full-select queue-select"><SelectValue /></SelectTrigger><SelectContent>{actualSessions.map((session) => <SelectItem value={session.id} key={session.id}>{formatDay(session.scheduledDate)} · {session.title}{session.status === "completed" ? " ✓" : ""}</SelectItem>)}</SelectContent></Select><div className="queue-list">{upcoming.slice(0, 4).map((session, queueIndex) => <button className={session.id === selected.id ? "queue-item queue-item-active" : "queue-item"} type="button" key={session.id} onClick={() => onNavigate("train", { sessionId: session.id, mode: "log" })}><span>{queueIndex + 1}</span><div><strong>{session.title}</strong><small>{formatDay(session.scheduledDate)} · {session.assignment === "together" ? "Together" : "Individual"}</small></div><ChevronRight aria-hidden="true" /></button>)}</div></section>
       <section className="training-principle-card"><Dumbbell aria-hidden="true" /><div><strong>Train the objective, not the calendar</strong><p>If this session no longer fits, move or replace it in Week. Weekly plan validation will recalculate immediately.</p></div></section>
     </div>

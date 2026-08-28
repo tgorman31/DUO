@@ -79,6 +79,8 @@ CREATE INDEX `strength_templates_team_idx` ON `strength_templates` (`team_id`);
 --> statement-breakpoint
 CREATE TABLE `strength_focus_slots` (`id` text PRIMARY KEY NOT NULL, `template_id` text NOT NULL REFERENCES `strength_templates`(`id`), `focus_id` text NOT NULL REFERENCES `training_focuses`(`id`), `exercise_id` text REFERENCES `catalogue_exercises`(`id`), `prescription` text DEFAULT '' NOT NULL, `sort_order` integer DEFAULT 0 NOT NULL, `notes` text DEFAULT '' NOT NULL);
 --> statement-breakpoint
+ALTER TABLE `strength_focus_slots` ADD `history_slot_id` text REFERENCES strength_slots(id);
+--> statement-breakpoint
 CREATE INDEX `strength_focus_slots_template_idx` ON `strength_focus_slots` (`template_id`, `sort_order`);
 --> statement-breakpoint
 CREATE TABLE `progression_tracks` (`id` text PRIMARY KEY NOT NULL, `team_id` text NOT NULL REFERENCES `training_teams`(`id`), `name` text NOT NULL, `purpose` text DEFAULT '' NOT NULL, `is_built_in` integer DEFAULT false NOT NULL, `active` integer DEFAULT true NOT NULL, `created_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL, `updated_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL);

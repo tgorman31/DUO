@@ -12,6 +12,7 @@ import { getDb } from "@/db";
 import { ensureSeeded, rebuildWeekSessions, resetTrainingData, type TrainingDb } from "@/db/seed";
 import {
   reconcileRecommendedWeek,
+  reconcileV2RecommendedWeek,
   unsetWeekPlanningState,
 } from "@/db/week-planning";
 import {
@@ -589,11 +590,11 @@ async function loadAppData(
     workoutKind,
     label: workoutKind === "strength-a" ? "Strength A" : "Strength B",
     slots: slotRows
-      .filter((slot) => slot.workoutKind === workoutKind)
+      .filter((slot) => slot.workoutKind === workoutKind && !slot.id.startsWith("v2-"))
       .map((slot) => {
         const baseSetting = settingFor(actor.id, slot.defaultExerciseId);
         const approved = parseJson<string[]>(baseSetting?.approvedAlternativesJson ?? "[]", []);
-        const rawOptions = alternativeRows.filter((option) => option.slotId === slot.id);
+        const rawOptions = alternativeRows.filter((option) => option.slotId === slot.id && !(slot.id === "a-hamstrings" && /\brdl\b|romanian deadlift|hip hinge/i.test(option.name)));
         const visibleOptions = approved.length
           ? rawOptions.filter(
               (option) =>
@@ -751,6 +752,7 @@ async function loadAppData(
       demoUrl: exercise.demoUrl,
       explanationUrl: exercise.explanationUrl,
       legacyExerciseId: exercise.legacyExerciseId,
+      historyExerciseId: exercise.legacyExerciseId ?? `catalogue-${exercise.id}`,
     })),
     locations: locationRowsV2.map((location) => ({
       id: location.id,
@@ -770,8 +772,10 @@ async function loadAppData(
         id: slot.id,
         templateId: slot.templateId,
         focusId: slot.focusId,
+        historySlotId: slot.historySlotId,
         focusName: focusRowsV2.find((focus) => focus.id === slot.focusId)?.name ?? slot.focusId,
         exerciseId: slot.exerciseId,
+        historyExerciseId: slot.exerciseId ? catalogueRowsV2.find((exercise) => exercise.id === slot.exerciseId)?.legacyExerciseId ?? `catalogue-${slot.exerciseId}` : null,
         exerciseName: slot.exerciseId ? catalogueRowsV2.find((exercise) => exercise.id === slot.exerciseId)?.name ?? null : null,
         prescription: slot.prescription,
         sortOrder: slot.sortOrder,
@@ -932,11 +936,13 @@ export async function POST(request: Request) {
       const intents = recommendation?.weekTypeId
         ? await db.select().from(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, recommendation.weekTypeId)).orderBy(asc(weekTypeDayIntents.day))
         : [];
-      await reconcileRecommendedWeek(db, week, true);
+      const materializedSessions = recommendation?.weekTypeId && intents.length
+        ? await reconcileV2RecommendedWeek(db, week, intents, true)
+        : await reconcileRecommendedWeek(db, week, true);
       const confirmedAt = nowIso();
       await db
         .update(plannedWeeks)
-        .set({ confirmedAt, status: "set", programmeWeekTypeId: recommendation?.weekTypeId ?? week.programmeWeekTypeId, programmePhaseId: recommendation?.phaseId ?? week.programmePhaseId, programmeSnapshotJson: JSON.stringify({ recommendation: recommendation ?? null, intents, capturedAt: confirmedAt }) , updatedAt: confirmedAt })
+        .set({ confirmedAt, status: "set", programmeWeekTypeId: recommendation?.weekTypeId ?? week.programmeWeekTypeId, programmePhaseId: recommendation?.phaseId ?? week.programmePhaseId, programmeSnapshotJson: JSON.stringify({ recommendation: recommendation ?? null, intents, materializedSessions, capturedAt: confirmedAt }) , updatedAt: confirmedAt })
         .where(eq(plannedWeeks.id, weekId));
       await recordPlanHistory(db, {
         weekId,
@@ -953,7 +959,8 @@ export async function POST(request: Request) {
     if (action === "setWeekType") {
       const weekId = asString(body.weekId);
       const weekType = asString(body.weekType);
-      const info = WEEK_TYPE_INFO[weekType];
+      const [v2Template] = await db.select().from(weekTypeTemplates).where(eq(weekTypeTemplates.id, `week-type-${weekType}`)).limit(1);
+      const info = WEEK_TYPE_INFO[weekType] ?? (v2Template ? { label: v2Template.name, rationale: v2Template.rationale, targets: { hard: v2Template.hardTarget, strength: v2Template.strengthTarget, easy: v2Template.easyTarget } } : null);
       if (!info) return apiError("Choose a valid week type.");
       const [week] = await db.select().from(plannedWeeks).where(eq(plannedWeeks.id, weekId)).limit(1);
       if (!week) return apiError("Week not found.", 404);
@@ -976,6 +983,9 @@ export async function POST(request: Request) {
       };
       await db.update(plannedWeeks).set(updated).where(eq(plannedWeeks.id, weekId));
       await rebuildWeekSessions(db, updated);
+      if (v2Template) {
+        await db.insert(programmeWeekRecommendations).values({ id: `programme-recommendation-${weekId}`, weekId, weekTypeId: v2Template.id, phaseId: null, progressionTrackId: null, title: v2Template.name, rationale: v2Template.rationale, qualityIntent: "", updatedAt: nowIso() }).onConflictDoUpdate({ target: programmeWeekRecommendations.weekId, set: { weekTypeId: v2Template.id, title: v2Template.name, rationale: v2Template.rationale, updatedAt: nowIso() } });
+      }
       await createActivity(db, actor.id, "plan", `${actor.displayName} selected ${info.label}.`, weekId);
       return Response.json({ ok: true });
     }
@@ -1590,19 +1600,16 @@ export async function POST(request: Request) {
           // V2 builders submit catalogue exercise/focus-slot ids while V1
           // history tables remain the canonical progression ledger. Resolve
           // both ids explicitly; never silently drop a valid V2 entry.
-          const historySlotId = slotId;
+          let historySlotId = slotId;
           let [slot] = await db.select().from(strengthSlots).where(eq(strengthSlots.id, slotId)).limit(1);
           if (!slot) {
             const [v2Slot] = await db.select().from(strengthFocusSlots).where(eq(strengthFocusSlots.id, slotId)).limit(1);
             if (v2Slot) {
-              const linkedTemplate = await db.select().from(strengthTemplates).where(eq(strengthTemplates.id, v2Slot.templateId)).limit(1).then((rows) => rows[0]);
-              const numbers = v2Slot.prescription.match(/(\d+)\s*[×x]\s*(\d+)(?:\s*[–-]\s*(\d+))?/i);
-              const compatibility = { id: slotId, workoutKind: linkedTemplate?.name.toLowerCase().includes("strength b") ? "strength-b" : "strength-a", sortOrder: v2Slot.sortOrder, trainingGoal: "V2 Training Focus", defaultExerciseId: "", workingSets: numbers ? Number(numbers[1]) : 3, repLow: numbers ? Number(numbers[2]) : 8, repHigh: numbers ? Number(numbers[3] ?? numbers[2]) : 10 };
-              await db.insert(strengthSlots).values(compatibility).onConflictDoNothing();
-              [slot] = await db.select().from(strengthSlots).where(eq(strengthSlots.id, historySlotId)).limit(1);
+              historySlotId = v2Slot.historySlotId ?? "";
+              if (historySlotId) [slot] = await db.select().from(strengthSlots).where(eq(strengthSlots.id, historySlotId)).limit(1);
             }
           }
-          if (!slot) return apiError(`Unknown strength slot: ${slotId}. Refresh the workout and try again.`, 422);
+          if (!slot || !historySlotId) return apiError(`Unknown strength slot: ${slotId}. Refresh the workout and try again.`, 422);
 
           let historyExerciseId = exerciseId;
           let [exercise] = await db.select().from(exercises).where(eq(exercises.id, exerciseId)).limit(1);
@@ -2036,11 +2043,29 @@ export async function POST(request: Request) {
       const id = cloneBuiltIn || !sourceId ? `strength-template-${crypto.randomUUID()}` : sourceId;
       if (existing && !cloneBuiltIn) await db.update(strengthTemplates).set({ name, purpose: asString(body.purpose), updatedAt: nowIso() }).where(eq(strengthTemplates.id, id));
       else if (!existing || cloneBuiltIn) await db.insert(strengthTemplates).values({ id, teamId: TEAM_ID, name, purpose: asString(body.purpose), isBuiltIn: false, baseTemplateId: cloneBuiltIn ? sourceId : null, active: true, updatedAt: nowIso() });
+      const previousSlots = await db.select().from(strengthFocusSlots).where(eq(strengthFocusSlots.templateId, id));
       await db.delete(strengthFocusSlots).where(eq(strengthFocusSlots.templateId, id));
-      const slotRows = slots.map((slot, index) => {
+      const slotRows: Array<typeof strengthFocusSlots.$inferInsert> = [];
+      for (const [index, slot] of slots.entries()) {
         const row = (slot ?? {}) as Record<string, unknown>;
-        return { id: asString(row.id) || `${id}-slot-${crypto.randomUUID()}`, templateId: id, focusId: asString(row.focusId), exerciseId: asString(row.exerciseId) || null, prescription: asString(row.prescription), sortOrder: index, notes: asString(row.notes) };
-      }).filter((row) => row.focusId);
+        const focusId = asString(row.focusId);
+        if (!focusId) continue;
+        const requestedId = asString(row.id);
+        const slotId = cloneBuiltIn || !requestedId || requestedId.startsWith("draft-") ? `${id}-slot-${index + 1}` : requestedId;
+        const exerciseId = asString(row.exerciseId) || null;
+        const catalogue = exerciseId ? await db.select().from(catalogueExercises).where(eq(catalogueExercises.id, exerciseId)).limit(1).then((rows) => rows[0]) : null;
+        if (exerciseId && !catalogue) return apiError("Choose a valid catalogue exercise for each Strength Focus.", 422);
+        const historyExerciseId = catalogue ? catalogue.legacyExerciseId ?? `catalogue-${catalogue.id}` : null;
+        const prior = previousSlots.find((item) => item.id === slotId);
+        const historySlotId = prior?.historySlotId ?? `${slotId}-history`;
+        const prescription = asString(row.prescription);
+        const numbers = prescription.match(/(\d+)\s*[×x]\s*(\d+)(?:\s*[–-]\s*(\d+))?/i);
+        const focus = await db.select().from(trainingFocuses).where(eq(trainingFocuses.id, focusId)).limit(1).then((rows) => rows[0]);
+        if (historyExerciseId) {
+          await db.insert(strengthSlots).values({ id: historySlotId, workoutKind: id, sortOrder: index, trainingGoal: focus?.name ?? "V2 Training Focus", defaultExerciseId: historyExerciseId, workingSets: numbers ? Number(numbers[1]) : 3, repLow: numbers ? Number(numbers[2]) : 8, repHigh: numbers ? Number(numbers[3] ?? numbers[2]) : 10 }).onConflictDoUpdate({ target: strengthSlots.id, set: { sortOrder: index, trainingGoal: focus?.name ?? "V2 Training Focus", defaultExerciseId: historyExerciseId, workingSets: numbers ? Number(numbers[1]) : 3, repLow: numbers ? Number(numbers[2]) : 8, repHigh: numbers ? Number(numbers[3] ?? numbers[2]) : 10 } });
+        }
+        slotRows.push({ id: slotId, templateId: id, focusId, exerciseId, historySlotId: historyExerciseId ? historySlotId : null, prescription, sortOrder: index, notes: asString(row.notes) });
+      }
       for (const batch of d1InsertBatches(slotRows)) await db.insert(strengthFocusSlots).values(batch);
       await createActivity(db, actor.id, "workout", `${actor.displayName} saved ${name} in the Strength Builder.`, id);
       return Response.json({ ok: true, templateId: id });
@@ -2052,7 +2077,11 @@ export async function POST(request: Request) {
       if (!template) return apiError("Only a built-in Strength A/B template can be reset.", 404);
       const baseSlots = JSON.parse(template.baseJson || "[]") as Array<Record<string, unknown>>;
       await db.delete(strengthFocusSlots).where(eq(strengthFocusSlots.templateId, templateId));
-      for (const [index, slot] of baseSlots.entries()) await db.insert(strengthFocusSlots).values({ id: asString(slot.id, `${templateId}-slot-${index}`), templateId, focusId: asString(slot.focusId), exerciseId: asString(slot.exerciseId) || null, prescription: asString(slot.prescription), sortOrder: index, notes: asString(slot.notes) });
+      for (const [index, slot] of baseSlots.entries()) {
+        const slotId = asString(slot.id, `${templateId}-slot-${index}`);
+        const historySlotId = asString(slot.historySlotId, slotId);
+        await db.insert(strengthFocusSlots).values({ id: slotId, templateId, focusId: asString(slot.focusId), exerciseId: asString(slot.exerciseId) || null, historySlotId, prescription: asString(slot.prescription), sortOrder: index, notes: asString(slot.notes) });
+      }
       return Response.json({ ok: true, templateId });
     }
 
