@@ -49,10 +49,13 @@ test("the complete training database seed fits D1 and is idempotent", async () =
       app_metadata: 1,
       athlete_sessions: 182,
       athletes: 2,
-      exercises: 36,
+      // Legacy 36 rows remain, plus stable history-compatibility rows for
+      // catalogue exercises without an exact V1 alias.
+      exercises: 122,
       planned_weeks: 13,
       shared_sessions: 91,
-      strength_slots: 14,
+      // Legacy slots plus stable V2 compatibility slots used by the builder.
+      strength_slots: 28,
       training_blocks: 1,
       training_phases: 6,
       training_teams: 1,
