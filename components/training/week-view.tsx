@@ -191,23 +191,7 @@ function SessionEditor({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
-        className="training-dialog routed-session-editor"
-        style={{
-          /* This editor is a routed screen on touch devices. Keep these
-             geometry values inline so browser/device viewport quirks cannot
-             collapse the portal into a half-width dialog. */
-          inset: 0,
-          width: "100vw",
-          maxWidth: "none",
-          height: "100dvh",
-          maxHeight: "100dvh",
-          transform: "none",
-          borderRadius: 0,
-          border: 0,
-          boxShadow: "none",
-        }}
-      >
+      <DialogContent className="training-dialog" mode="responsive-editor">
         <DialogHeader>
           <DialogTitle>Move or replace session</DialogTitle>
           <DialogDescription>
@@ -296,20 +280,7 @@ function AddSessionDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
-        className="training-dialog routed-session-editor"
-        style={{
-          inset: 0,
-          width: "100vw",
-          maxWidth: "none",
-          height: "100dvh",
-          maxHeight: "100dvh",
-          transform: "none",
-          borderRadius: 0,
-          border: 0,
-          boxShadow: "none",
-        }}
-      >
+      <DialogContent className="training-dialog" mode="responsive-editor">
         <DialogHeader>
           <DialogTitle>Add a session</DialogTitle>
           <DialogDescription>Choose a reusable workout, day and athlete scope. Weekly warnings update automatically.</DialogDescription>
