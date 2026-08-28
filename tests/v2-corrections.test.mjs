@@ -7,8 +7,11 @@ import { Miniflare } from "miniflare";
 import "tsx";
 import * as schema from "../db/schema.ts";
 
-const { ensureSeeded, resetTrainingData, LEGACY_SLOT_FOCUS_MAP } = await import("../db/seed.ts");
+const { ensureSeeded, resetTrainingData, LEGACY_SLOT_FOCUS_MAP, LEGACY_CATALOGUE_ALIAS_MAP } = await import("../db/seed.ts");
 const { reconcileV2RecommendedWeek } = await import("../db/week-planning.ts");
+const { completeStrengthEntries } = await import("../lib/strength-completion.ts");
+const { cloneStrengthTemplate } = await import("../lib/strength-template.ts");
+const { exerciseAvailable } = await import("../lib/equipment.ts");
 
 async function applyMigrations(binding) {
   const directory = new URL("../drizzle/", import.meta.url);
@@ -150,5 +153,95 @@ test("factory reset is foreign-key safe and reseeds built-ins without replacing 
     assert.equal((await db.select().from(schema.trainingFocuses)).length, 14);
     assert.equal((await db.select().from(schema.strengthFocusSlots).where(eq(schema.strengthFocusSlots.templateId, "strength-template-a"))).length, 7);
     assert.equal((await db.select().from(schema.strengthFocusSlots).where(eq(schema.strengthFocusSlots.templateId, "strength-template-b"))).length, 7);
+  } finally { await miniflare.dispose(); }
+});
+
+test("programme-week intents preserve race and recovery-specific recommendations", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    for (const [weekId, expectedDay, expectedTitle] of [["week-2026-11-09", 2, "HYROX Dublin"], ["week-2026-11-30", 4, "HYROX London"]]) {
+      const [week] = await db.select().from(schema.plannedWeeks).where(eq(schema.plannedWeeks.id, weekId));
+      const intents = await db.select().from(schema.programmeWeekDayIntents).where(eq(schema.programmeWeekDayIntents.weekId, weekId));
+      const rows = await reconcileV2RecommendedWeek(db, week, intents, true);
+      assert.equal(rows.find((row) => row.sortOrder === expectedDay)?.title, expectedTitle);
+    }
+    const [recoveryWeek] = await db.select().from(schema.plannedWeeks).where(eq(schema.plannedWeeks.id, "week-2026-11-16"));
+    const recoveryIntents = await db.select().from(schema.programmeWeekDayIntents).where(eq(schema.programmeWeekDayIntents.weekId, recoveryWeek.id));
+    const materialized = await reconcileV2RecommendedWeek(db, recoveryWeek, recoveryIntents, true);
+    assert.equal(materialized[0].title, "Dublin recovery");
+    assert.notEqual(materialized[0].title, "Tread and Shred");
+  } finally { await miniflare.dispose(); }
+});
+
+test("programme progression override materializes current LT2 and VO2 steps", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    const [week] = await db.select().from(schema.plannedWeeks).where(eq(schema.plannedWeeks.id, "week-2026-09-21"));
+    const [intent] = await db.select().from(schema.programmeWeekDayIntents).where(eq(schema.programmeWeekDayIntents.weekId, week.id)).where(eq(schema.programmeWeekDayIntents.day, 3));
+    const lt2Rows = await reconcileV2RecommendedWeek(db, week, [{ ...intent, progressionTrackId: "track-lt2-running", workoutId: null }], true);
+    assert.equal(lt2Rows[0].title, "3 × 8 min");
+    const vo2Rows = await reconcileV2RecommendedWeek(db, week, [{ ...intent, progressionTrackId: "track-vo2-running", workoutId: null }], true);
+    assert.equal(vo2Rows[0].title, "8 × 2 min");
+  } finally { await miniflare.dispose(); }
+});
+
+test("built-in V2 Strength A/B slots are fully resolved and aliases are explicit", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    const slots = await db.select().from(schema.strengthFocusSlots);
+    for (const templateId of ["strength-template-a", "strength-template-b"]) {
+      const rows = slots.filter((slot) => slot.templateId === templateId);
+      assert.equal(rows.length, 7);
+      for (const row of rows) {
+        assert.ok(row.exerciseId && row.historySlotId && row.prescription);
+        assert.ok((await db.select().from(schema.catalogueExercises).where(eq(schema.catalogueExercises.id, row.exerciseId))).length);
+        const [historySlot] = await db.select().from(schema.strengthSlots).where(eq(schema.strengthSlots.id, row.historySlotId));
+        assert.ok(historySlot?.defaultExerciseId);
+      }
+    }
+    assert.equal(LEGACY_CATALOGUE_ALIAS_MAP["db-rdl"], "duo-ex-011");
+    assert.equal(LEGACY_CATALOGUE_ALIAS_MAP["db-shoulder-press"], "duo-ex-040");
+  } finally { await miniflare.dispose(); }
+});
+
+test("Strength A clone service creates independent V2 and history identities", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    const result = await cloneStrengthTemplate(db, "strength-template-a", { id: "strength-template-clone-service", teamId: "team-thomas-kt", name: "Strength A Clone Service" });
+    assert.equal(result.slotCount, 7);
+    const base = await db.select().from(schema.strengthFocusSlots).where(eq(schema.strengthFocusSlots.templateId, "strength-template-a"));
+    const clone = await db.select().from(schema.strengthFocusSlots).where(eq(schema.strengthFocusSlots.templateId, result.id));
+    assert.equal(clone.length, 7);
+    assert.ok(clone.every((row) => !base.some((source) => source.id === row.id || source.historySlotId === row.historySlotId)));
+    assert.equal((await db.select().from(schema.strengthTemplates).where(eq(schema.strengthTemplates.id, "strength-template-a"))).length, 1);
+  } finally { await miniflare.dispose(); }
+});
+
+test("equipment matching canonicalizes wall balls and HYROX sled pull setup", () => {
+  assert.equal(exerciseAvailable("Wall Ball", "None", ["Wall Balls"]), true);
+  assert.equal(exerciseAvailable("Sled", "None", ["Sled"]), true);
+  assert.equal(exerciseAvailable("Sled", "Battle Ropes", ["Sled"]), true);
+  assert.equal(exerciseAvailable("Sled", "Battle Ropes", []), false);
+  assert.equal(exerciseAvailable("Dumbbell", "Bench (Flat)", ["Dumbbell"]), false);
+  assert.equal(exerciseAvailable("Dumbbell", "Bench (Flat)", ["Dumbbell", "Bench (Flat)"]), true);
+});
+
+test("real strength completion persists catalogue history and failed replacement is non-destructive", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    const [session] = await db.select().from(schema.athleteSessions).where(eq(schema.athleteSessions.athleteId, "thomas")).limit(1);
+    const [slot] = await db.select().from(schema.strengthSlots).where(eq(schema.strengthSlots.id, "a-knee"));
+    const [catalogue] = await db.select().from(schema.catalogueExercises).where(eq(schema.catalogueExercises.id, "duo-ex-001"));
+    const resultId = `result-${session.id}`;
+    await db.insert(schema.workoutResults).values({ id: resultId, sessionId: session.id, athleteId: "thomas", completedDate: session.scheduledDate, rpe: 7, feel: 8, averagePace: "", totalTime: "", notes: "" });
+    const first = { slotId: slot.id, exerciseId: catalogue.id, sets: [{ weightKg: 80, reps: 7 }, { weightKg: 80, reps: 7 }, { weightKg: 80, reps: 7 }] };
+    await completeStrengthEntries(db, { resultId, athleteId: "thomas", completedDate: session.scheduledDate, entries: [first] });
+    assert.equal((await db.select().from(schema.exercisePerformances).where(eq(schema.exercisePerformances.resultId, resultId))).length, 1);
+    assert.equal((await db.select().from(schema.strengthSets)).filter((row) => row.performanceId.startsWith(`performance-${resultId}`)).length, 3);
+    const [state] = await db.select().from(schema.progressionStates).where(eq(schema.progressionStates.exerciseId, "smith-squat")).where(eq(schema.progressionStates.athleteId, "thomas"));
+    assert.equal(state?.recommendedLoadKg, 85);
+    const before = await db.select().from(schema.exercisePerformances).where(eq(schema.exercisePerformances.resultId, resultId));
+    await assert.rejects(() => completeStrengthEntries(db, { resultId, athleteId: "thomas", completedDate: session.scheduledDate, entries: [first, { slotId: "missing", exerciseId: catalogue.id, sets: [{ weightKg: 1, reps: 1 }] }] }));
+    assert.deepEqual(await db.select().from(schema.exercisePerformances).where(eq(schema.exercisePerformances.resultId, resultId)), before);
   } finally { await miniflare.dispose(); }
 });
