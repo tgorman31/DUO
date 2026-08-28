@@ -1,0 +1,1 @@
+ALTER TABLE `exercises` ADD `hyrox_carryover_json` text DEFAULT '[]' NOT NULL;

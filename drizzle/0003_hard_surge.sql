@@ -1,0 +1,1 @@
+ALTER TABLE `athletes` ADD `title_bar_color` text DEFAULT '#000080' NOT NULL;
