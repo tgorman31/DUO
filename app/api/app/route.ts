@@ -13,7 +13,7 @@ import { ensureSeeded, rebuildWeekSessions, resetTrainingData, type TrainingDb }
 import {
   reconcileRecommendedWeek,
   reconcileV2RecommendedWeek,
-  applyWeekTypeToProgrammeWeek,
+  setProgrammeWeekType,
   unsetWeekPlanningState,
 } from "@/db/week-planning";
 import {
@@ -998,8 +998,7 @@ export async function POST(request: Request) {
       await db.update(plannedWeeks).set(updated).where(eq(plannedWeeks.id, weekId));
       await rebuildWeekSessions(db, updated);
       if (v2Template) {
-        await db.insert(programmeWeekRecommendations).values({ id: `programme-recommendation-${weekId}`, weekId, weekTypeId: v2Template.id, phaseId: null, progressionTrackId: null, title: v2Template.name, rationale: v2Template.rationale, qualityIntent: "", updatedAt: nowIso() }).onConflictDoUpdate({ target: programmeWeekRecommendations.weekId, set: { weekTypeId: v2Template.id, title: v2Template.name, rationale: v2Template.rationale, updatedAt: nowIso() } });
-        await applyWeekTypeToProgrammeWeek(db, weekId, v2Template.id);
+        await setProgrammeWeekType(db, weekId, v2Template.id);
       }
       await createActivity(db, actor.id, "plan", `${actor.displayName} selected ${info.label}.`, weekId);
       return Response.json({ ok: true });

@@ -8,7 +8,7 @@ import "tsx";
 import * as schema from "../db/schema.ts";
 
 const { ensureSeeded, resetTrainingData, LEGACY_SLOT_FOCUS_MAP, LEGACY_CATALOGUE_ALIAS_MAP } = await import("../db/seed.ts");
-const { reconcileV2RecommendedWeek, applyWeekTypeToProgrammeWeek } = await import("../db/week-planning.ts");
+const { reconcileV2RecommendedWeek, applyWeekTypeToProgrammeWeek, setProgrammeWeekType } = await import("../db/week-planning.ts");
 const { completeStrengthEntries } = await import("../lib/strength-completion.ts");
 const { cloneStrengthTemplate } = await import("../lib/strength-template.ts");
 const { exerciseAvailable } = await import("../lib/equipment.ts");
@@ -305,6 +305,38 @@ test("applying a different Week Type replaces stale programme intents", async ()
   } finally { await miniflare.dispose(); }
 });
 
+test("an explicit Week Type change clears the previous programme progression", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    const weekId = "week-2026-09-21";
+    const [initial] = await db.select().from(schema.programmeWeekRecommendations).where(eq(schema.programmeWeekRecommendations.weekId, weekId));
+    assert.equal(initial.weekTypeId, "week-type-running-priority");
+    assert.equal(initial.progressionTrackId, "track-lt2-running");
+    assert.match(initial.qualityIntent, /LT2/);
+
+    const everlastIntents = await setProgrammeWeekType(db, weekId, "week-type-everlast");
+    const [afterEverlast] = await db.select().from(schema.programmeWeekRecommendations).where(eq(schema.programmeWeekRecommendations.weekId, weekId));
+    assert.equal(afterEverlast.weekTypeId, "week-type-everlast");
+    assert.equal(afterEverlast.progressionTrackId, null);
+    assert.equal(afterEverlast.qualityIntent, "");
+    assert.ok(everlastIntents.some((intent) => intent.intent === "Everlast sled session"));
+    assert.ok(everlastIntents.every((intent) => intent.progressionTrackId !== "track-lt2-running"));
+    const [week] = await db.select().from(schema.plannedWeeks).where(eq(schema.plannedWeeks.id, weekId));
+    const everlastSessions = await reconcileV2RecommendedWeek(db, week, everlastIntents, true, { sharedProgression: true });
+    assert.ok(everlastSessions.some((row) => row.title.toLowerCase().includes("everlast")));
+    assert.ok(everlastSessions.every((row) => row.title !== "3 × 8 min"));
+
+    const runningIntents = await setProgrammeWeekType(db, weekId, "week-type-running-priority");
+    const [afterRunning] = await db.select().from(schema.programmeWeekRecommendations).where(eq(schema.programmeWeekRecommendations.weekId, weekId));
+    assert.equal(afterRunning.weekTypeId, "week-type-running-priority");
+    assert.equal(afterRunning.progressionTrackId, null);
+    assert.equal(afterRunning.qualityIntent, "");
+    assert.ok(runningIntents.every((intent) => intent.progressionTrackId !== "track-lt2-running"));
+    const runningSessions = await reconcileV2RecommendedWeek(db, week, runningIntents, true, { sharedProgression: true });
+    assert.ok(runningSessions.every((row) => row.title !== "3 × 8 min"));
+  } finally { await miniflare.dispose(); }
+});
+
 test("materialized locations use explicit day context, not Building Gym blanket defaults", async () => {
   const { miniflare, db } = await seededDb();
   try {
@@ -341,6 +373,28 @@ test("shared progression is deterministic regardless of the Set Week caller", as
     const asThomas = await reconcileV2RecommendedWeek(db, week, [{ ...intent, progressionTrackId: "track-lt2-running" }], true, { athleteId: "thomas", sharedProgression: true });
     const asKt = await reconcileV2RecommendedWeek(db, week, [{ ...intent, progressionTrackId: "track-lt2-running" }], true, { athleteId: "kt", sharedProgression: true });
     assert.equal(asThomas[0].title, "3 × 10 min");
+    assert.equal(asKt[0].title, asThomas[0].title);
+  } finally { await miniflare.dispose(); }
+});
+
+test("shared progression treats missing athlete state as step zero", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    const [week] = await db.select().from(schema.plannedWeeks).where(eq(schema.plannedWeeks.id, "week-2026-09-21"));
+    const [intent] = await db.select().from(schema.programmeWeekDayIntents).where(eq(schema.programmeWeekDayIntents.weekId, week.id)).where(eq(schema.programmeWeekDayIntents.day, 3));
+    const materializeAsBoth = async () => Promise.all([
+      reconcileV2RecommendedWeek(db, week, [{ ...intent, progressionTrackId: "track-lt2-running" }], true, { athleteId: "thomas", sharedProgression: true }),
+      reconcileV2RecommendedWeek(db, week, [{ ...intent, progressionTrackId: "track-lt2-running" }], true, { athleteId: "kt", sharedProgression: true }),
+    ]);
+
+    await db.insert(schema.progressionStatesV2).values({ athleteId: "thomas", trackId: "track-lt2-running", currentStep: 2, togetherPending: false, updatedAt: new Date().toISOString() });
+    let [asThomas, asKt] = await materializeAsBoth();
+    assert.equal(asThomas[0].title, "3 × 8 min");
+    assert.equal(asKt[0].title, asThomas[0].title);
+
+    await db.delete(schema.progressionStatesV2).where(eq(schema.progressionStatesV2.trackId, "track-lt2-running"));
+    [asThomas, asKt] = await materializeAsBoth();
+    assert.equal(asThomas[0].title, "3 × 8 min");
     assert.equal(asKt[0].title, asThomas[0].title);
   } finally { await miniflare.dispose(); }
 });

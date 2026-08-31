@@ -1,6 +1,6 @@
 import { eq } from "drizzle-orm";
 import type { TrainingDb } from "./seed";
-import { athleteSessions, plannedWeeks, sharedSessions, strengthTemplates, weekTypeDayIntents, programmeWeekDayIntents, workoutLibraryItems, progressionTracks, progressionSteps, progressionStatesV2 } from "./schema";
+import { athleteSessions, plannedWeeks, programmeWeekRecommendations, sharedSessions, strengthTemplates, weekTypeDayIntents, weekTypeTemplates, programmeWeekDayIntents, workoutLibraryItems, progressionTracks, progressionSteps, progressionStatesV2 } from "./schema";
 import {
   addDays,
   scheduleForWeek,
@@ -58,6 +58,43 @@ export async function applyWeekTypeToProgrammeWeek(db: TrainingDb, weekId: strin
     await db.insert(programmeWeekDayIntents).values(copied.slice(index, index + 20));
   }
   return copied;
+}
+
+/**
+ * Apply an explicit single-week structural change. Programme-week intent rows
+ * are deliberately more specific than a Week Type, but an athlete choosing a
+ * different Week Type is also choosing to discard the old structure's quality
+ * progression. A new progression must be selected deliberately afterwards.
+ */
+export async function setProgrammeWeekType(db: TrainingDb, weekId: string, weekTypeId: string) {
+  const [template] = await db.select().from(weekTypeTemplates).where(eq(weekTypeTemplates.id, weekTypeId)).limit(1);
+  if (!template) throw new Error("Programme Week Type not found.");
+  const now = new Date().toISOString();
+  await db
+    .insert(programmeWeekRecommendations)
+    .values({
+      id: `programme-recommendation-${weekId}`,
+      weekId,
+      weekTypeId: template.id,
+      phaseId: null,
+      progressionTrackId: null,
+      title: template.name,
+      rationale: template.rationale,
+      qualityIntent: "",
+      updatedAt: now,
+    })
+    .onConflictDoUpdate({
+      target: programmeWeekRecommendations.weekId,
+      set: {
+        weekTypeId: template.id,
+        progressionTrackId: null,
+        title: template.name,
+        rationale: template.rationale,
+        qualityIntent: "",
+        updatedAt: now,
+      },
+    });
+  return applyWeekTypeToProgrammeWeek(db, weekId, weekTypeId);
 }
 
 const ATHLETE_IDS = ["thomas", "kt"] as const;
@@ -191,8 +228,11 @@ export async function reconcileV2RecommendedWeek(
       const [track] = await db.select().from(progressionTracks).where(eq(progressionTracks.id, intent.progressionTrackId)).limit(1);
       if (track) {
         const states = await db.select().from(progressionStatesV2).where(eq(progressionStatesV2.trackId, track.id)).limit(10);
+        // A Together progression cannot advance past either athlete. Missing
+        // state is explicitly step zero, rather than being omitted from the
+        // minimum and allowing the other athlete's later row to win.
         const state = options.sharedProgression
-          ? states.sort((a, b) => a.currentStep - b.currentStep)[0]
+          ? { currentStep: Math.min(...ATHLETE_IDS.map((athleteId) => states.find((row) => row.athleteId === athleteId)?.currentStep ?? 0)) }
           : options.athleteId
             ? states.find((row) => row.athleteId === options.athleteId)
             : undefined;
