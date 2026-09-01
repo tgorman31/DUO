@@ -8,7 +8,7 @@ import "tsx";
 import * as schema from "../db/schema.ts";
 
 const { ensureSeeded, resetTrainingData, LEGACY_SLOT_FOCUS_MAP, LEGACY_CATALOGUE_ALIAS_MAP } = await import("../db/seed.ts");
-const { reconcileV2RecommendedWeek, applyWeekTypeToProgrammeWeek, setProgrammeWeekType } = await import("../db/week-planning.ts");
+const { reconcileV2RecommendedWeek, resolveV2ProgrammeRows, applyWeekTypeToProgrammeWeek, applyWeekTypeTemplatePropagation, setProgrammeWeekType } = await import("../db/week-planning.ts");
 const { completeStrengthEntries } = await import("../lib/strength-completion.ts");
 const { completeProgressionForSession } = await import("../lib/progression-completion.ts");
 const { cloneStrengthTemplate } = await import("../lib/strength-template.ts");
@@ -498,5 +498,49 @@ test("progression completion service is idempotent, rejects wrong steps, and coo
     await completeProgressionForSession(db, kt, "kt");
     state = (await db.select().from(schema.progressionStatesV2).where(and(eq(schema.progressionStatesV2.athleteId, "thomas"), eq(schema.progressionStatesV2.trackId, "track-lt2-running"))))[0];
     assert.equal(state.currentStep, 2, "Together completion must never regress an ahead athlete");
+  } finally { await miniflare.dispose(); }
+});
+
+test("built-in Week Type bases use canonical immutable metadata", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    const [template] = await db.select().from(schema.weekTypeTemplates).where(eq(schema.weekTypeTemplates.id, "week-type-running-priority"));
+    const base = JSON.parse(template.baseJson);
+    for (const key of ["name", "rationale", "hardTarget", "strengthTarget", "easyTarget", "defaultLocationId", "priorityEmphasis", "active", "intents"]) assert.ok(Object.prototype.hasOwnProperty.call(base, key), key);
+    assert.equal(base.hardTarget, 2);
+    assert.equal(base.intents.length, 7);
+    await db.update(schema.weekTypeTemplates).set({ name: "Mutated current", hardTarget: 3, strengthTarget: 1, easyTarget: 4 }).where(eq(schema.weekTypeTemplates.id, template.id));
+    const [after] = await db.select().from(schema.weekTypeTemplates).where(eq(schema.weekTypeTemplates.id, template.id));
+    const unchangedBase = JSON.parse(after.baseJson);
+    assert.equal(unchangedBase.name, template.name);
+    assert.equal(unchangedBase.hardTarget, 2);
+  } finally { await miniflare.dispose(); }
+});
+
+test("read-only programme resolver matches materialisation without writing", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    const [week] = await db.select().from(schema.plannedWeeks).where(eq(schema.plannedWeeks.id, "week-2026-09-21"));
+    const intents = await db.select().from(schema.programmeWeekDayIntents).where(eq(schema.programmeWeekDayIntents.weekId, week.id));
+    const before = { shared: (await db.select().from(schema.sharedSessions)).length, athlete: (await db.select().from(schema.athleteSessions)).length };
+    const preview = await resolveV2ProgrammeRows(db, week, intents, { sharedProgression: true });
+    assert.equal(preview.find((row) => row.sortOrder === 0)?.title, "Tread and Shred");
+    assert.equal(preview.find((row) => row.sortOrder === 3)?.title, "3 × 8 min");
+    const afterPreview = { shared: (await db.select().from(schema.sharedSessions)).length, athlete: (await db.select().from(schema.athleteSessions)).length };
+    assert.deepEqual(afterPreview, before);
+    const materialized = await reconcileV2RecommendedWeek(db, week, intents, true, { sharedProgression: true });
+    assert.deepEqual(materialized.map((row) => ({ day: row.sortOrder, title: row.title, locationId: row.locationId })), preview.map((row) => ({ day: row.sortOrder, title: row.title, locationId: row.locationId })));
+  } finally { await miniflare.dispose(); }
+});
+
+test("template propagation updates derived intents while preserving programme overrides", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    const weekId = "week-2026-09-21";
+    await db.update(schema.programmeWeekDayIntents).set({ intent: "Race-specific override", isProgrammeOverride: true }).where(and(eq(schema.programmeWeekDayIntents.weekId, weekId), eq(schema.programmeWeekDayIntents.day, 0)));
+    await db.update(schema.weekTypeDayIntents).set({ intent: "Updated template intent" }).where(and(eq(schema.weekTypeDayIntents.weekTypeId, "week-type-running-priority"), eq(schema.weekTypeDayIntents.day, 1)));
+    const rows = await applyWeekTypeTemplatePropagation(db, weekId, "week-type-running-priority");
+    assert.equal(rows.find((row) => row.day === 0)?.intent, "Race-specific override");
+    assert.equal(rows.find((row) => row.day === 1)?.intent, "Updated template intent");
   } finally { await miniflare.dispose(); }
 });

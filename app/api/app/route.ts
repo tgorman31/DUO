@@ -13,7 +13,8 @@ import { ensureSeeded, rebuildWeekSessions, resetTrainingData, type TrainingDb }
 import {
   reconcileRecommendedWeek,
   reconcileV2RecommendedWeek,
-  applyWeekTypeToProgrammeWeek,
+  resolveV2ProgrammeRows,
+  applyWeekTypeTemplatePropagation,
   setProgrammeWeekType,
   unsetWeekPlanningState,
 } from "@/db/week-planning";
@@ -106,6 +107,23 @@ const validTitleBarColors = new Set([
 
 function apiError(message: string, status = 400) {
   return Response.json({ error: message }, { status });
+}
+
+function nextIsoDate(value: string) {
+  const date = new Date(`${value}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + 1);
+  return date.toISOString().slice(0, 10);
+}
+
+function phaseCoverageError(phases: Array<{ startDate: string; endDate: string }>, block: { startDate: string; endDate: string }) {
+  const ordered = [...phases].sort((a, b) => a.startDate.localeCompare(b.startDate));
+  if (!ordered.length) return "At least one phase is required to cover the training block.";
+  if (ordered[0].startDate !== block.startDate) return `Programme phases leave ${block.startDate}–${nextIsoDate(ordered[0].startDate)} uncovered.`;
+  for (let index = 1; index < ordered.length; index += 1) {
+    if (ordered[index].startDate !== nextIsoDate(ordered[index - 1].endDate)) return `Programme phases leave ${nextIsoDate(ordered[index - 1].endDate)}–${nextIsoDate(ordered[index].startDate)} uncovered.`;
+  }
+  if (ordered.at(-1)?.endDate !== block.endDate) return `Programme phases leave ${nextIsoDate(ordered.at(-1)?.endDate ?? block.startDate)}–${block.endDate} uncovered.`;
+  return null;
 }
 
 function asString(value: unknown, fallback = "") {
@@ -2184,15 +2202,18 @@ export async function POST(request: Request) {
       const templateId = asString(body.templateId);
       const [template] = await db.select().from(weekTypeTemplates).where(eq(weekTypeTemplates.id, templateId)).limit(1);
       if (!template) return apiError("Week Type not found.", 404);
-      const update = { name: asString(body.name, template.name), rationale: asString(body.rationale, template.rationale), hardTarget: Math.max(0, Math.round(asNumber(body.hardTarget, template.hardTarget) ?? template.hardTarget)), strengthTarget: Math.max(0, Math.round(asNumber(body.strengthTarget, template.strengthTarget) ?? template.strengthTarget)), easyTarget: Math.max(0, Math.round(asNumber(body.easyTarget, template.easyTarget) ?? template.easyTarget)), priorityEmphasis: asString(body.priorityEmphasis, template.priorityEmphasis), updatedAt: nowIso() };
+      const update = { name: asString(body.name, template.name), rationale: asString(body.rationale, template.rationale), hardTarget: Math.max(0, Math.round(asNumber(body.hardTarget, template.hardTarget) ?? template.hardTarget)), strengthTarget: Math.max(0, Math.round(asNumber(body.strengthTarget, template.strengthTarget) ?? template.strengthTarget)), easyTarget: Math.max(0, Math.round(asNumber(body.easyTarget, template.easyTarget) ?? template.easyTarget)), defaultLocationId: Object.prototype.hasOwnProperty.call(body, "defaultLocationId") ? (asString(body.defaultLocationId) || null) : template.defaultLocationId, priorityEmphasis: asString(body.priorityEmphasis, template.priorityEmphasis), updatedAt: nowIso() };
       if (Array.isArray(body.intents)) {
         const intents = body.intents as Array<Record<string, unknown>>;
         const days = intents.map((item) => asNumber(item.day));
         if (intents.length !== 7 || new Set(days).size !== 7 || days.some((day) => day === null || day < 0 || day > 6)) return apiError("A Week Type needs seven unique Monday–Sunday intents.", 422);
         const rows = intents.map((item) => ({ id: `${templateId}-${asNumber(item.day)}`, weekTypeId: templateId, day: asNumber(item.day) as number, intent: asString(item.intent, "Rest / recovery"), workoutId: asString(item.workoutId) || null, strengthTemplateId: asString(item.strengthTemplateId) || null, progressionTrackId: asString(item.progressionTrackId) || null, locationId: asString(item.locationId) || null, priorityEmphasis: asString(item.priorityEmphasis, "balanced"), category: asString(item.category, "recovery"), workoutKind: asString(item.workoutKind, "recovery"), details: asString(item.details), isQualityIntent: Boolean(item.isQualityIntent) }));
         if (rows.some((row) => !validCategories.has(row.category) || !["balanced", "thomas", "kt"].includes(row.priorityEmphasis))) return apiError("One or more daily intents has an invalid category or priority emphasis.", 422);
+        const qualityRows = rows.filter((row) => row.isQualityIntent);
+        if (qualityRows.length > 1) return apiError("A Week Type can have only one programme progression day.", 422);
+        if (qualityRows.some((row) => row.category === "recovery" || row.workoutKind === "recovery")) return apiError("Rest / Recovery cannot be the programme progression day.", 422);
         const [workouts, templates, tracks, locations] = await Promise.all([db.select({ id: workoutLibraryItems.id }).from(workoutLibraryItems), db.select({ id: strengthTemplates.id }).from(strengthTemplates), db.select({ id: progressionTracks.id }).from(progressionTracks), db.select({ id: trainingLocations.id }).from(trainingLocations)]);
-        if (rows.some((row) => (row.workoutId && !workouts.some((item) => item.id === row.workoutId)) || (row.strengthTemplateId && !templates.some((item) => item.id === row.strengthTemplateId)) || (row.progressionTrackId && !tracks.some((item) => item.id === row.progressionTrackId)) || (row.locationId && !locations.some((item) => item.id === row.locationId)))) return apiError("One or more daily intent references an unavailable workout, Strength template, progression or location.", 422);
+        if ((update.defaultLocationId && !locations.some((item) => item.id === update.defaultLocationId)) || rows.some((row) => (row.workoutId && !workouts.some((item) => item.id === row.workoutId)) || (row.strengthTemplateId && !templates.some((item) => item.id === row.strengthTemplateId)) || (row.progressionTrackId && !tracks.some((item) => item.id === row.progressionTrackId)) || (row.locationId && !locations.some((item) => item.id === row.locationId)))) return apiError("One or more daily intent references an unavailable workout, Strength template, progression or location.", 422);
         // Only replace the existing day structure after the full payload has
         // resolved. A malformed editor submission therefore leaves the prior
         // seven-day Week Type intact.
@@ -2216,15 +2237,65 @@ export async function POST(request: Request) {
       return Response.json({ ok: true, templateId: id });
     }
 
+    if (action === "createWeekType") {
+      const name = asString(body.name, "New Week Type").trim();
+      if (!name) return apiError("Week Type name is required.", 422);
+      const id = `week-type-custom-${crypto.randomUUID()}`;
+      const now = nowIso();
+      await db.insert(weekTypeTemplates).values({ id, teamId: TEAM_ID, name, rationale: asString(body.rationale), hardTarget: 0, strengthTarget: 0, easyTarget: 0, defaultLocationId: null, priorityEmphasis: "balanced", isBuiltIn: false, active: true, baseJson: "{}", updatedAt: now });
+      const rows = Array.from({ length: 7 }, (_, day) => ({ id: `${id}-${day}`, weekTypeId: id, day, intent: "Rest / recovery", workoutId: null, strengthTemplateId: null, progressionTrackId: null, locationId: null, priorityEmphasis: "balanced", category: "recovery", workoutKind: "recovery", details: "", isQualityIntent: false }));
+      await db.insert(weekTypeDayIntents).values(rows);
+      return Response.json({ ok: true, templateId: id });
+    }
+
+    if (action === "disableWeekType" || action === "deleteWeekType") {
+      const templateId = asString(body.templateId);
+      const [template] = await db.select().from(weekTypeTemplates).where(eq(weekTypeTemplates.id, templateId)).limit(1);
+      if (!template) return apiError("Week Type not found.", 404);
+      if (template.isBuiltIn) return apiError("Built-in Week Types cannot be deleted.", 409);
+      const refs = await db.select().from(plannedWeeks).where(eq(plannedWeeks.programmeWeekTypeId, templateId));
+      if (action === "deleteWeekType" && refs.length) return apiError("This Week Type is used by programme history. Disable it instead.", 409);
+      await db.update(weekTypeTemplates).set({ active: false, updatedAt: nowIso() }).where(eq(weekTypeTemplates.id, templateId));
+      return Response.json({ ok: true, templateId, disabled: true });
+    }
+
+    if (action === "previewWeekTypePropagation") {
+      const templateId = asString(body.templateId);
+      const [template] = await db.select({ id: weekTypeTemplates.id }).from(weekTypeTemplates).where(eq(weekTypeTemplates.id, templateId)).limit(1);
+      if (!template) return apiError("Week Type not found.", 404);
+      const recommendations = await db.select({ weekId: programmeWeekRecommendations.weekId }).from(programmeWeekRecommendations).where(eq(programmeWeekRecommendations.weekTypeId, templateId));
+      const weeks = recommendations.length ? await db.select().from(plannedWeeks).where(inArray(plannedWeeks.id, recommendations.map((row) => row.weekId))) : [];
+      const candidates = weeks.filter((week) => week.startDate >= todayIso() && !week.confirmedAt && !["in_progress", "complete"].includes(week.status));
+      const eligible = [] as typeof candidates;
+      const protectedWeeks = weeks.filter((week) => !candidates.some((item) => item.id === week.id));
+      const conflicts: string[] = [];
+      for (const week of candidates) {
+        const intents = await db.select().from(programmeWeekDayIntents).where(eq(programmeWeekDayIntents.weekId, week.id));
+        const templateIntents = await db.select().from(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, templateId));
+        const hasExplicitProgression = intents.some((intent) => intent.isProgrammeOverride && Boolean(intent.progressionTrackId));
+        if (hasExplicitProgression && !templateIntents.some((intent) => intent.isQualityIntent)) conflicts.push(week.id);
+        else eligible.push(week);
+      }
+      return Response.json({ ok: true, eligibleWeekIds: eligible.map((week) => week.id), eligibleCount: eligible.length, protectedCount: protectedWeeks.length, conflicts });
+    }
+
     if (action === "updateFutureWeeksFromWeekType") {
       const templateId = asString(body.templateId);
       const [template] = await db.select().from(weekTypeTemplates).where(eq(weekTypeTemplates.id, templateId)).limit(1);
       if (!template) return apiError("Week Type not found.", 404);
       const recommendations = await db.select().from(programmeWeekRecommendations).where(eq(programmeWeekRecommendations.weekTypeId, templateId));
       const weeks = await db.select().from(plannedWeeks).where(inArray(plannedWeeks.id, recommendations.map((row) => row.weekId)));
-      const eligible = weeks.filter((week) => week.startDate >= todayIso() && !week.confirmedAt && !["in_progress", "complete"].includes(week.status));
-      for (const week of eligible) await applyWeekTypeToProgrammeWeek(db, week.id, templateId);
-      return Response.json({ ok: true, eligibleWeekIds: eligible.map((week) => week.id) });
+      const candidates = weeks.filter((week) => week.startDate >= todayIso() && !week.confirmedAt && !["in_progress", "complete"].includes(week.status));
+      const templateIntents = await db.select().from(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, templateId));
+      const eligible = [] as typeof candidates;
+      for (const week of candidates) {
+        const intents = await db.select().from(programmeWeekDayIntents).where(eq(programmeWeekDayIntents.weekId, week.id));
+        const hasExplicitProgression = intents.some((intent) => intent.isProgrammeOverride && Boolean(intent.progressionTrackId));
+        if (hasExplicitProgression && !templateIntents.some((intent) => intent.isQualityIntent)) continue;
+        eligible.push(week);
+      }
+      for (const week of eligible) await applyWeekTypeTemplatePropagation(db, week.id, templateId);
+      return Response.json({ ok: true, eligibleWeekIds: eligible.map((week) => week.id), eligibleCount: eligible.length });
     }
 
     if (action === "updateProgrammeWeek") {
@@ -2245,14 +2316,19 @@ export async function POST(request: Request) {
       const weekId = asString(body.weekId);
       const [week] = await db.select().from(plannedWeeks).where(eq(plannedWeeks.id, weekId)).limit(1);
       if (!week) return apiError("Programme week not found.", 404);
-      const weekTypeId = asString(body.weekTypeId) || `week-type-${week.weekType}`;
-      const intents = await db.select().from(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, weekTypeId)).orderBy(asc(weekTypeDayIntents.day));
-      const progressionTrackId = asString(body.progressionTrackId);
-      const [track] = progressionTrackId ? await db.select().from(progressionTracks).where(eq(progressionTracks.id, progressionTrackId)).limit(1) : [];
-      const steps = track ? await db.select().from(progressionSteps).where(eq(progressionSteps.trackId, track.id)).orderBy(asc(progressionSteps.sortOrder)) : [];
-      const [state] = progressionTrackId ? await db.select().from(progressionStatesV2).where(and(eq(progressionStatesV2.trackId, progressionTrackId), eq(progressionStatesV2.athleteId, actor.id))).limit(1) : [];
-      const qualityDay = intents.find((intent) => intent.isQualityIntent)?.day;
-      return Response.json({ ok: true, days: intents.map((intent) => { const step = intent.day === qualityDay && track && steps.length && (state?.currentStep ?? 0) < steps.length ? steps[state?.currentStep ?? 0] : null; return { day: intent.day, title: step?.title ?? intent.intent, category: step ? "hard" : intent.category, workoutKind: step ? "run-quality" : intent.workoutKind, locationId: intent.locationId }; }) });
+      const recommendation = await db.select().from(programmeWeekRecommendations).where(eq(programmeWeekRecommendations.weekId, weekId)).limit(1).then((rows) => rows[0]);
+      const hasDraftWeekType = Object.prototype.hasOwnProperty.call(body, "weekTypeId");
+      const weekTypeId = asString(body.weekTypeId) || recommendation?.weekTypeId || `week-type-${week.weekType}`;
+      const currentProgrammeIntents = await db.select().from(programmeWeekDayIntents).where(eq(programmeWeekDayIntents.weekId, weekId)).orderBy(asc(programmeWeekDayIntents.day));
+      const selectedIntents = !hasDraftWeekType || weekTypeId === recommendation?.weekTypeId
+        ? (currentProgrammeIntents.length ? currentProgrammeIntents : await db.select().from(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, weekTypeId)).orderBy(asc(weekTypeDayIntents.day)))
+        : await db.select().from(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, weekTypeId)).orderBy(asc(weekTypeDayIntents.day));
+      const progressionTrackId = Object.prototype.hasOwnProperty.call(body, "progressionTrackId") ? asString(body.progressionTrackId) : recommendation?.progressionTrackId ?? "";
+      const qualityDay = selectedIntents.find((intent) => intent.isQualityIntent)?.day;
+      const intents = selectedIntents.map((intent) => qualityDay === intent.day ? { ...intent, progressionTrackId: progressionTrackId || null } : { ...intent, progressionTrackId: null });
+      const [weekType] = await db.select().from(weekTypeTemplates).where(eq(weekTypeTemplates.id, weekTypeId)).limit(1);
+      const rows = await resolveV2ProgrammeRows(db, week, intents, { defaultLocationId: weekType?.defaultLocationId ?? null, sharedProgression: true });
+      return Response.json({ ok: true, days: rows.map((row) => ({ day: row.sortOrder, title: row.title, category: row.category, workoutKind: row.workoutKind, locationId: row.locationId, details: row.details, progressionTrackId: row.progressionTrackId, progressionStepId: row.progressionStepId })) });
     }
 
     if (action === "completeProgressionStep") {
@@ -2363,7 +2439,16 @@ export async function POST(request: Request) {
       let base: Record<string, unknown> = {};
       try { base = JSON.parse(template.baseJson || "{}"); } catch { base = {}; }
       const intents = await db.select().from(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, templateId)).orderBy(asc(weekTypeDayIntents.day));
-      return Response.json({ ok: true, template: { ...template, name: asString(base.name, template.name), rationale: asString(base.rationale, template.rationale), hardTarget: Number(base.hardTarget ?? template.hardTarget), strengthTarget: Number(base.strengthTarget ?? template.strengthTarget), easyTarget: Number(base.easyTarget ?? template.easyTarget), priorityEmphasis: asString(base.priorityEmphasis, template.priorityEmphasis), intents: Array.isArray(base.intents) && base.intents.length === 7 ? base.intents : intents } });
+      return Response.json({ ok: true, template: { ...template, name: asString(base.name, template.name), rationale: asString(base.rationale, template.rationale), hardTarget: Number(base.hardTarget ?? template.hardTarget), strengthTarget: Number(base.strengthTarget ?? template.strengthTarget), easyTarget: Number(base.easyTarget ?? template.easyTarget), defaultLocationId: typeof base.defaultLocationId === "string" ? base.defaultLocationId : null, priorityEmphasis: asString(base.priorityEmphasis, template.priorityEmphasis), active: base.active !== false, intents: Array.isArray(base.intents) && base.intents.length === 7 ? base.intents : intents } });
+    }
+
+    if (action === "viewProgrammeSnapshot") {
+      const weekId = asString(body.weekId);
+      const [week] = await db.select({ id: plannedWeeks.id, programmeSnapshotJson: plannedWeeks.programmeSnapshotJson, confirmedAt: plannedWeeks.confirmedAt, status: plannedWeeks.status }).from(plannedWeeks).where(eq(plannedWeeks.id, weekId)).limit(1);
+      if (!week) return apiError("Programme week not found.", 404);
+      let snapshot: Record<string, unknown> = {};
+      try { snapshot = JSON.parse(week.programmeSnapshotJson || "{}"); } catch { snapshot = {}; }
+      return Response.json({ ok: true, snapshot, confirmedAt: week.confirmedAt, status: week.status });
     }
 
     if (action === "resetWeekTypeTemplate") {
@@ -2375,7 +2460,7 @@ export async function POST(request: Request) {
       const baseIntents = Array.isArray(base.intents) ? base.intents as Array<Record<string, unknown>> : [];
       if (baseIntents.length !== 7) return apiError("The DUO base for this Week Type is incomplete.", 409);
       const rows = baseIntents.map((item, index) => ({ id: `${templateId}-${asNumber(item.day, index)}`, weekTypeId: templateId, day: asNumber(item.day, index) as number, intent: asString(item.intent, "Rest / recovery"), workoutId: asString(item.workoutId) || null, strengthTemplateId: asString(item.strengthTemplateId) || null, progressionTrackId: asString(item.progressionTrackId) || null, locationId: asString(item.locationId) || null, priorityEmphasis: asString(item.priorityEmphasis, "balanced"), category: asString(item.category, "recovery"), workoutKind: asString(item.workoutKind, "recovery"), details: asString(item.details), isQualityIntent: Boolean(item.isQualityIntent) }));
-      await db.update(weekTypeTemplates).set({ name: asString(base.name, template.name), rationale: asString(base.rationale, template.rationale), hardTarget: Math.max(0, Math.round(asNumber(base.hardTarget, template.hardTarget) ?? template.hardTarget)), strengthTarget: Math.max(0, Math.round(asNumber(base.strengthTarget, template.strengthTarget) ?? template.strengthTarget)), easyTarget: Math.max(0, Math.round(asNumber(base.easyTarget, template.easyTarget) ?? template.easyTarget)), priorityEmphasis: asString(base.priorityEmphasis, template.priorityEmphasis), updatedAt: nowIso() }).where(eq(weekTypeTemplates.id, templateId));
+      await db.update(weekTypeTemplates).set({ name: asString(base.name, template.name), rationale: asString(base.rationale, template.rationale), hardTarget: Math.max(0, Math.round(asNumber(base.hardTarget, template.hardTarget) ?? template.hardTarget)), strengthTarget: Math.max(0, Math.round(asNumber(base.strengthTarget, template.strengthTarget) ?? template.strengthTarget)), easyTarget: Math.max(0, Math.round(asNumber(base.easyTarget, template.easyTarget) ?? template.easyTarget)), defaultLocationId: typeof base.defaultLocationId === "string" ? base.defaultLocationId : null, priorityEmphasis: asString(base.priorityEmphasis, template.priorityEmphasis), active: base.active !== false, updatedAt: nowIso() }).where(eq(weekTypeTemplates.id, templateId));
       await db.delete(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, templateId));
       for (const batch of d1InsertBatches(rows)) await db.insert(weekTypeDayIntents).values(batch);
       return Response.json({ ok: true, templateId });
@@ -2390,6 +2475,9 @@ export async function POST(request: Request) {
       if (!asString(body.name, block.name) || startDate > endDate) return apiError("Block name and valid dates are required.");
       const phasesOutside = await db.select().from(trainingPhases).where(and(eq(trainingPhases.blockId, blockId), sql`${trainingPhases.startDate} < ${startDate} or ${trainingPhases.endDate} > ${endDate}`));
       if (phasesOutside.length) return apiError("Update the affected phase dates before shortening this block.", 409);
+      const phases = await db.select().from(trainingPhases).where(eq(trainingPhases.blockId, blockId));
+      const coverageError = phaseCoverageError(phases, { startDate, endDate });
+      if (coverageError) return apiError(coverageError, 422);
       await db.update(trainingBlocks).set({ name: asString(body.name, block.name), startDate, endDate, trainingGoal: asString(body.trainingGoal, block.trainingGoal), notes: asString(body.notes, block.notes) }).where(eq(trainingBlocks.id, blockId));
       return Response.json({ ok: true });
     }
@@ -2409,13 +2497,22 @@ export async function POST(request: Request) {
       const id = existing?.id ?? `phase-${crypto.randomUUID()}`;
       const values = { blockId, name, startDate, endDate, focus: asString(body.focus, existing?.focus ?? ""), sortOrder: Math.max(0, Math.round(asNumber(body.sortOrder, existing?.sortOrder ?? (await db.select({ count: sql<number>`count(*)` }).from(trainingPhases).where(eq(trainingPhases.blockId, blockId)))[0]?.count ?? 0) ?? 0)) };
       if (existing) await db.update(trainingPhases).set(values).where(eq(trainingPhases.id, id)); else await db.insert(trainingPhases).values({ id, ...values });
+      const allPhases = await db.select().from(trainingPhases).where(eq(trainingPhases.blockId, blockId));
+      const coverageError = phaseCoverageError(allPhases, block);
+      if (coverageError) {
+        if (existing) await db.update(trainingPhases).set({ name: existing.name, startDate: existing.startDate, endDate: existing.endDate, focus: existing.focus, sortOrder: existing.sortOrder }).where(eq(trainingPhases.id, id));
+        else await db.delete(trainingPhases).where(eq(trainingPhases.id, id));
+        return apiError(coverageError, 422);
+      }
       // Phase dates are the programme order. Recalculate only editable future
       // recommendations, never snapshots or historical weeks.
-      const phases = await db.select().from(trainingPhases).where(eq(trainingPhases.blockId, blockId));
+      const phases = allPhases.sort((a, b) => a.startDate.localeCompare(b.startDate));
+      for (const [index, phase] of phases.entries()) await db.update(trainingPhases).set({ sortOrder: index }).where(eq(trainingPhases.id, phase.id));
       const futureWeeks = await db.select().from(plannedWeeks).where(and(eq(plannedWeeks.blockId, blockId), isNull(plannedWeeks.confirmedAt), sql`${plannedWeeks.status} not in ('in_progress', 'complete')`));
       for (const week of futureWeeks) {
         const resolved = phases.find((phase) => phase.startDate <= week.startDate && phase.endDate >= week.startDate) ?? null;
         await db.update(programmeWeekRecommendations).set({ phaseId: resolved?.id ?? null, updatedAt: nowIso() }).where(eq(programmeWeekRecommendations.weekId, week.id));
+        await db.update(plannedWeeks).set({ programmePhaseId: resolved?.id ?? null, updatedAt: nowIso() }).where(eq(plannedWeeks.id, week.id));
       }
       return Response.json({ ok: true, phaseId: id });
     }
@@ -2426,22 +2523,23 @@ export async function POST(request: Request) {
       if (!phase) return apiError("Phase not found.", 404);
       const protectedWeeks = await db.select().from(plannedWeeks).where(and(eq(plannedWeeks.blockId, phase.blockId), sql`${plannedWeeks.startDate} between ${phase.startDate} and ${phase.endDate}`, sql`${plannedWeeks.confirmedAt} is not null or ${plannedWeeks.status} in ('in_progress', 'complete')`));
       if (protectedWeeks.length) return apiError("This phase contains Set or historical weeks. Reassign eligible future weeks instead.", 409);
+      const remaining = await db.select().from(trainingPhases).where(and(eq(trainingPhases.blockId, phase.blockId), sql`${trainingPhases.id} != ${phase.id}`));
+      const [block] = await db.select().from(trainingBlocks).where(eq(trainingBlocks.id, phase.blockId)).limit(1);
+      if (block) {
+        const coverageError = phaseCoverageError(remaining, block);
+        if (coverageError) return apiError(coverageError, 422);
+      }
       await db.update(programmeWeekRecommendations).set({ phaseId: null, updatedAt: nowIso() }).where(eq(programmeWeekRecommendations.phaseId, phaseId));
       await db.delete(trainingPhases).where(eq(trainingPhases.id, phaseId));
+      const remainingAfterDelete = await db.select().from(trainingPhases).where(eq(trainingPhases.blockId, phase.blockId)).orderBy(asc(trainingPhases.startDate));
+      for (const [index, item] of remainingAfterDelete.entries()) await db.update(trainingPhases).set({ sortOrder: index }).where(eq(trainingPhases.id, item.id));
+      const futureWeeks = await db.select().from(plannedWeeks).where(and(eq(plannedWeeks.blockId, phase.blockId), isNull(plannedWeeks.confirmedAt), sql`${plannedWeeks.status} not in ('in_progress', 'complete')`));
+      for (const week of futureWeeks) {
+        const resolved = remainingAfterDelete.find((item) => item.startDate <= week.startDate && item.endDate >= week.startDate) ?? null;
+        await db.update(programmeWeekRecommendations).set({ phaseId: resolved?.id ?? null, updatedAt: nowIso() }).where(eq(programmeWeekRecommendations.weekId, week.id));
+        await db.update(plannedWeeks).set({ programmePhaseId: resolved?.id ?? null, updatedAt: nowIso() }).where(eq(plannedWeeks.id, week.id));
+      }
       return Response.json({ ok: true });
-    }
-
-    if (action === "legacyUpdatePhase") {
-      const phaseId = asString(body.phaseId);
-      const [phase] = await db.select().from(trainingPhases).where(eq(trainingPhases.id, phaseId)).limit(1);
-      if (!phase) return apiError("Phase not found.", 404);
-      const name = asString(body.name, phase.name);
-      const startDate = asString(body.startDate, phase.startDate);
-      const endDate = asString(body.endDate, phase.endDate);
-      if (!name || startDate > endDate) return apiError("Phase name and valid dates are required.");
-      const affected = await db.select({ id: plannedWeeks.id, confirmedAt: plannedWeeks.confirmedAt }).from(plannedWeeks).where(and(eq(plannedWeeks.blockId, phase.blockId), sql`${plannedWeeks.startDate} between ${startDate} and ${endDate}`));
-      await db.update(trainingPhases).set({ name, startDate, endDate, focus: asString(body.focus, phase.focus) }).where(eq(trainingPhases.id, phaseId));
-      return Response.json({ ok: true, phaseId, protectedWeeks: affected.filter((item) => item.confirmedAt).length });
     }
 
     if (action === "createBlock") {

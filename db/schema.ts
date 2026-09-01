@@ -420,6 +420,7 @@ export const programmeWeekDayIntents = sqliteTable("programme_week_day_intents",
   workoutKind: text("workout_kind").notNull().default(""),
   details: text("details").notNull().default(""),
   isQualityIntent: integer("is_quality_intent", { mode: "boolean" }).notNull().default(false),
+  isProgrammeOverride: integer("is_programme_override", { mode: "boolean" }).notNull().default(false),
 }, (table) => [uniqueIndex("programme_week_day_intent_unique").on(table.weekId, table.day)]);
 
 export const programmeWeekRecommendations = sqliteTable("programme_week_recommendations", {

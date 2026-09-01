@@ -53,11 +53,51 @@ export async function applyWeekTypeToProgrammeWeek(db: TrainingDb, weekId: strin
     workoutKind: intent.workoutKind,
     details: intent.details,
     isQualityIntent: intent.isQualityIntent,
+    isProgrammeOverride: false,
   }));
   for (let index = 0; index < copied.length; index += 20) {
     await db.insert(programmeWeekDayIntents).values(copied.slice(index, index + 20));
   }
   return copied;
+}
+
+/** Merge a reusable template into a future recommendation. Explicit programme
+ * day overrides (race/recovery decisions or a deliberate single-day edit) are
+ * retained; template-derived rows are updated to the new template. */
+export async function applyWeekTypeTemplatePropagation(db: TrainingDb, weekId: string, weekTypeId: string) {
+  const [week] = await db.select({ confirmedAt: plannedWeeks.confirmedAt, status: plannedWeeks.status }).from(plannedWeeks).where(eq(plannedWeeks.id, weekId)).limit(1);
+  if (!week) throw new Error("Programme week not found.");
+  if (week.confirmedAt || ["in_progress", "complete"].includes(week.status)) throw new Error("Only future unset programme weeks can be updated.");
+  const templateIntents = await db.select().from(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, weekTypeId));
+  const existing = await db.select().from(programmeWeekDayIntents).where(eq(programmeWeekDayIntents.weekId, weekId));
+  const rows = templateIntents.map((intent) => {
+    const prior = existing.find((item) => item.day === intent.day);
+    if (prior?.isProgrammeOverride) return prior;
+    return {
+      id: prior?.id ?? `programme-intent-${weekId}-${intent.day}`,
+      weekId,
+      day: intent.day,
+      intent: intent.intent,
+      workoutId: intent.workoutId,
+      strengthTemplateId: intent.strengthTemplateId,
+      progressionTrackId: intent.progressionTrackId,
+      locationId: intent.locationId,
+      priorityEmphasis: intent.priorityEmphasis,
+      category: intent.category,
+      workoutKind: intent.workoutKind,
+      details: intent.details,
+      isQualityIntent: intent.isQualityIntent,
+      isProgrammeOverride: false,
+    };
+  });
+  const retainedDays = new Set(rows.map((row) => row.day));
+  for (const prior of existing) {
+    if (prior.isProgrammeOverride && !retainedDays.has(prior.day)) rows.push(prior);
+  }
+  for (const row of rows) {
+    await db.insert(programmeWeekDayIntents).values(row).onConflictDoUpdate({ target: programmeWeekDayIntents.id, set: { intent: row.intent, workoutId: row.workoutId, strengthTemplateId: row.strengthTemplateId, progressionTrackId: row.progressionTrackId, locationId: row.locationId, priorityEmphasis: row.priorityEmphasis, category: row.category, workoutKind: row.workoutKind, details: row.details, isQualityIntent: row.isQualityIntent, isProgrammeOverride: row.isProgrammeOverride } });
+  }
+  return rows;
 }
 
 /**
@@ -210,8 +250,53 @@ export async function reconcileV2RecommendedWeek(
   const now = new Date().toISOString();
   const currentAthleteRows = await db.select().from(athleteSessions).where(eq(athleteSessions.weekId, week.id));
   const desired = new Set<string>();
-  const materialized: Array<Record<string, unknown>> = [];
-  for (const intent of intents.sort((a, b) => a.day - b.day)) {
+  const materialized = await resolveV2ProgrammeRows(db, week, intents, options);
+  for (const row of materialized) {
+    const intent = intents.find((item) => item.day === row.sortOrder);
+    if (!intent) continue;
+    const existing = currentAthleteRows.filter((item) => item.sortOrder === row.sortOrder);
+    await db.insert(sharedSessions).values(row).onConflictDoUpdate({ target: sharedSessions.id, set: { scheduledDate: row.scheduledDate, title: row.title, category: row.category, workoutKind: row.workoutKind, details: row.details, workoutTemplateId: row.workoutTemplateId, progressionTrackId: row.progressionTrackId, progressionStepId: row.progressionStepId, locationId: row.locationId, assignment: row.assignment, sortOrder: row.sortOrder, updatedAt: now } });
+    for (const athleteId of ATHLETE_IDS) {
+      const id = `session-${athleteId}-${week.id}-${row.sortOrder}`;
+      desired.add(id);
+      const existingRow = existing.find((item) => item.id === id);
+      if (existingRow?.status === "completed") continue;
+      const values = { id, weekId: week.id, sharedSessionId: row.id, athleteId, scheduledDate: row.scheduledDate, title: row.title, category: row.category, workoutKind: row.workoutKind, details: row.details, workoutTemplateId: row.workoutTemplateId, progressionTrackId: row.progressionTrackId, progressionStepId: row.progressionStepId, locationId: row.locationId, assignment: row.assignment, status: activate ? "planned" : "removed", completedAt: null, sortOrder: row.sortOrder, updatedAt: now };
+      if (existingRow) await db.update(athleteSessions).set(values).where(eq(athleteSessions.id, id));
+      else await db.insert(athleteSessions).values(values);
+    }
+  }
+  for (const row of currentAthleteRows) if (row.status !== "completed" && !desired.has(row.id)) await db.update(athleteSessions).set({ status: "removed", assignment: "individual", updatedAt: now }).where(eq(athleteSessions.id, row.id));
+  return materialized;
+}
+
+/**
+ * Resolve the programme recommendation without writing anything.  Preview and
+ * materialisation deliberately share this function so the Programme Designer
+ * cannot show a schedule that differs from Set Shared Week.
+ */
+export async function resolveV2ProgrammeRows(
+  db: TrainingDb,
+  week: WeekPlanBasis,
+  intents: Array<ProgrammeIntent>,
+  options: { defaultLocationId?: string | null; athleteId?: string; sharedProgression?: boolean } = {},
+) {
+  const materialized: Array<{
+    id: string;
+    weekId: string;
+    scheduledDate: string;
+    title: string;
+    category: string;
+    workoutKind: string;
+    details: string;
+    workoutTemplateId: string | null;
+    progressionTrackId: string | null;
+    progressionStepId: string | null;
+    locationId: string | null;
+    assignment: string;
+    sortOrder: number;
+  }> = [];
+  for (const intent of [...intents].sort((a, b) => a.day - b.day)) {
     const template = intent.strengthTemplateId ? await db.select().from(strengthTemplates).where(eq(strengthTemplates.id, intent.strengthTemplateId)).limit(1).then((rows) => rows[0]) : null;
     let workout = intent.workoutId ? await db.select().from(workoutLibraryItems).where(eq(workoutLibraryItems.id, intent.workoutId)).limit(1).then((rows) => rows[0]) : null;
     if (!workout && template) workout = await db.select().from(workoutLibraryItems).where(eq(workoutLibraryItems.strengthTemplateId, template.id)).limit(1).then((rows) => rows[0]);
@@ -277,19 +362,8 @@ export async function reconcileV2RecommendedWeek(
       assignment: "together",
       sortOrder: intent.day,
     };
-    await db.insert(sharedSessions).values(row).onConflictDoUpdate({ target: sharedSessions.id, set: { scheduledDate: row.scheduledDate, title: row.title, category: row.category, workoutKind: row.workoutKind, details: row.details, workoutTemplateId: row.workoutTemplateId, progressionTrackId: row.progressionTrackId, progressionStepId: row.progressionStepId, locationId: row.locationId, assignment: row.assignment, sortOrder: row.sortOrder, updatedAt: now } });
     materialized.push(row);
-    for (const athleteId of ATHLETE_IDS) {
-      const id = `session-${athleteId}-${week.id}-${intent.day}`;
-      desired.add(id);
-      const existing = currentAthleteRows.find((item) => item.id === id);
-      if (existing?.status === "completed") continue;
-      const values = { id, weekId: week.id, sharedSessionId: row.id, athleteId, scheduledDate: row.scheduledDate, title: row.title, category: row.category, workoutKind: row.workoutKind, details: row.details, workoutTemplateId: row.workoutTemplateId, progressionTrackId: row.progressionTrackId, progressionStepId: row.progressionStepId, locationId: row.locationId, assignment: row.assignment, status: activate ? "planned" : "removed", completedAt: null, sortOrder: row.sortOrder, updatedAt: now };
-      if (existing) await db.update(athleteSessions).set(values).where(eq(athleteSessions.id, id));
-      else await db.insert(athleteSessions).values(values);
-    }
   }
-  for (const row of currentAthleteRows) if (row.status !== "completed" && !desired.has(row.id)) await db.update(athleteSessions).set({ status: "removed", assignment: "individual", updatedAt: now }).where(eq(athleteSessions.id, row.id));
   return materialized;
 }
 

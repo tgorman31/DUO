@@ -373,7 +373,7 @@ async function ensureV2Data(db: TrainingDb) {
   }
 
   const weekTypeRows = Object.entries(WEEK_TYPE_INFO).map(([id, info]) => ({
-    id: `week-type-${id}`, teamId: TEAM_ID, name: info.label, rationale: info.rationale, hardTarget: info.targets.hard, strengthTarget: info.targets.strength, easyTarget: info.targets.easy, defaultLocationId: null, priorityEmphasis: "balanced", isBuiltIn: true, active: true, baseJson: JSON.stringify(info), updatedAt: now,
+    id: `week-type-${id}`, teamId: TEAM_ID, name: info.label, rationale: info.rationale, hardTarget: info.targets.hard, strengthTarget: info.targets.strength, easyTarget: info.targets.easy, defaultLocationId: null, priorityEmphasis: "balanced", isBuiltIn: true, active: true, baseJson: JSON.stringify({ name: info.label, rationale: info.rationale, hardTarget: info.targets.hard, strengthTarget: info.targets.strength, easyTarget: info.targets.easy, defaultLocationId: null, priorityEmphasis: "balanced", active: true, intents: [] }), updatedAt: now,
   }));
   for (const batch of d1InsertBatches(weekTypeRows)) await db.insert(weekTypeTemplates).values(batch).onConflictDoNothing();
   for (const template of weekTypeRows) {
@@ -412,9 +412,15 @@ async function ensureV2Data(db: TrainingDb) {
     const [current] = await db.select({ baseJson: weekTypeTemplates.baseJson }).from(weekTypeTemplates).where(eq(weekTypeTemplates.id, weekType.id)).limit(1);
     let base: Record<string, unknown> = {};
     try { base = JSON.parse(current?.baseJson || "{}"); } catch { base = {}; }
-    if (!Array.isArray(base.intents) || base.intents.length !== 7) {
+    const canonicalKeys = ["name", "rationale", "hardTarget", "strengthTarget", "easyTarget", "defaultLocationId", "priorityEmphasis", "active"];
+    const hasCanonicalMetadata = canonicalKeys.every((key) => Object.prototype.hasOwnProperty.call(base, key));
+    if (!Array.isArray(base.intents) || base.intents.length !== 7 || !hasCanonicalMetadata) {
       const intents = dayIntents.filter((intent) => intent.weekTypeId === weekType.id).map((intent) => ({ day: intent.day, intent: intent.intent, workoutId: intent.workoutId, strengthTemplateId: intent.strengthTemplateId, progressionTrackId: intent.progressionTrackId, locationId: intent.locationId, priorityEmphasis: intent.priorityEmphasis, category: intent.category, workoutKind: intent.workoutKind, details: intent.details, isQualityIntent: intent.isQualityIntent }));
-      await db.update(weekTypeTemplates).set({ baseJson: JSON.stringify({ ...WEEK_TYPE_INFO[weekType.id.replace("week-type-", "")], intents }), updatedAt: now }).where(eq(weekTypeTemplates.id, weekType.id));
+      const info = WEEK_TYPE_INFO[weekType.id.replace("week-type-", "")];
+      const baseName = typeof base.name === "string" ? base.name : info.label;
+      const baseRationale = typeof base.rationale === "string" ? base.rationale : info.rationale;
+      const basePriority = typeof base.priorityEmphasis === "string" ? base.priorityEmphasis : "balanced";
+      await db.update(weekTypeTemplates).set({ baseJson: JSON.stringify({ name: baseName, rationale: baseRationale, hardTarget: Number(base.hardTarget ?? (base.targets as { hard?: number } | undefined)?.hard ?? info.targets.hard), strengthTarget: Number(base.strengthTarget ?? (base.targets as { strength?: number } | undefined)?.strength ?? info.targets.strength), easyTarget: Number(base.easyTarget ?? (base.targets as { easy?: number } | undefined)?.easy ?? info.targets.easy), defaultLocationId: base.defaultLocationId ?? null, priorityEmphasis: basePriority, active: base.active !== false, intents }), updatedAt: now }).where(eq(weekTypeTemplates.id, weekType.id));
     }
   }
   const weeks = await db.select().from(plannedWeeks);
@@ -451,12 +457,13 @@ async function ensureV2Data(db: TrainingDb) {
         workoutKind: item.workoutKind,
         details: item.details,
         isQualityIntent,
+        isProgrammeOverride: ["week-2026-11-09", "week-2026-11-16", "week-2026-11-30"].includes(week.id),
       };
     });
   });
   for (const batch of d1InsertBatches(programmeIntents)) await db.insert(programmeWeekDayIntents).values(batch).onConflictDoNothing();
   for (const intent of programmeIntents) {
-    await db.update(programmeWeekDayIntents).set({ isQualityIntent: intent.isQualityIntent, locationId: intent.locationId }).where(eq(programmeWeekDayIntents.id, intent.id));
+    await db.update(programmeWeekDayIntents).set({ isQualityIntent: intent.isQualityIntent, locationId: intent.locationId, isProgrammeOverride: intent.isProgrammeOverride }).where(eq(programmeWeekDayIntents.id, intent.id));
   }
 
   // Conditioning coverage is explicit metadata, not a name-matching guess.
@@ -486,13 +493,13 @@ export async function ensureSeeded(db: TrainingDb) {
       .from(appMetadata)
       .where(eq(appMetadata.key, "data-version"))
       .limit(1);
-    if (!versionMarker || versionMarker.value !== "2.2") {
+    if (!versionMarker || versionMarker.value !== "2.3") {
       await ensureV11Data(db);
       await ensureV2Data(db);
       await db
         .insert(appMetadata)
-        .values({ key: "data-version", value: "2.2", updatedAt: new Date().toISOString() })
-        .onConflictDoUpdate({ target: appMetadata.key, set: { value: "2.2", updatedAt: new Date().toISOString() } });
+        .values({ key: "data-version", value: "2.3", updatedAt: new Date().toISOString() })
+        .onConflictDoUpdate({ target: appMetadata.key, set: { value: "2.3", updatedAt: new Date().toISOString() } });
     } else {
       // 0007 is additive; an existing V2 database may have the marker but no
       // programme-week intent rows yet. Backfill only when the new layer is

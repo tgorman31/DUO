@@ -274,7 +274,10 @@ function NewBlockDialog({ open, onOpenChange, mutate }: { open: boolean; onOpenC
   );
 }
 
-export function LegacyProgrammeDesigner({ data, mutate }: { data: AppData; mutate: Mutate }) {
+/** Deprecated V1 reference implementation. BlocksView uses ProgrammeDesignerUI;
+ * retained privately for historical markup comparison, never mounted. */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function DeprecatedProgrammeDesigner({ data, mutate }: { data: AppData; mutate: Mutate }) {
   const [tab, setTab] = useState("overview");
   const [blockEditor, setBlockEditor] = useState(false);
   const [blockDraft, setBlockDraft] = useState(() => ({ name: data.block.name, startDate: data.block.startDate, endDate: data.block.endDate, trainingGoal: data.block.trainingGoal, notes: data.block.notes }));
