@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile, readdir } from "node:fs/promises";
 import test from "node:test";
 import { drizzle } from "drizzle-orm/d1";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { Miniflare } from "miniflare";
 import "tsx";
 import * as schema from "../db/schema.ts";
@@ -445,5 +445,25 @@ test("built-in direct workout coverage seeds idempotently", async () => {
     await ensureSeeded(db);
     const threshold = await db.select().from(schema.workoutHyroxCoverage).where(eq(schema.workoutHyroxCoverage.workoutId, "lib-hyrox-threshold"));
     assert.deepEqual(threshold.map((row) => row.station).sort(), ["Burpee Broad Jumps", "Row", "Running"]);
+  } finally { await miniflare.dispose(); }
+});
+
+test("progression materialisation writes explicit track and step identities and stops when complete", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    const [week] = await db.select().from(schema.plannedWeeks).where(eq(schema.plannedWeeks.id, "week-2026-09-21"));
+    const intents = await db.select().from(schema.programmeWeekDayIntents).where(eq(schema.programmeWeekDayIntents.weekId, week.id));
+    await reconcileV2RecommendedWeek(db, week, intents, true, { sharedProgression: true });
+    const [quality] = await db.select().from(schema.athleteSessions).where(and(eq(schema.athleteSessions.weekId, week.id), eq(schema.athleteSessions.sortOrder, 3), eq(schema.athleteSessions.athleteId, "thomas")));
+    assert.equal(quality.progressionTrackId, "track-lt2-running");
+    assert.equal(quality.progressionStepId, "track-lt2-running-1");
+    await db.insert(schema.progressionStatesV2).values([
+      { athleteId: "thomas", trackId: "track-lt2-running", currentStep: 4, togetherPending: false, updatedAt: new Date().toISOString() },
+      { athleteId: "kt", trackId: "track-lt2-running", currentStep: 4, togetherPending: false, updatedAt: new Date().toISOString() },
+    ]);
+    await reconcileV2RecommendedWeek(db, week, intents, true, { sharedProgression: true });
+    const [completed] = await db.select().from(schema.athleteSessions).where(and(eq(schema.athleteSessions.weekId, week.id), eq(schema.athleteSessions.sortOrder, 3), eq(schema.athleteSessions.athleteId, "thomas")));
+    assert.equal(completed.progressionTrackId, null);
+    assert.match(completed.title, /Progression complete/);
   } finally { await miniflare.dispose(); }
 });
