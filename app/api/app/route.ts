@@ -2185,12 +2185,27 @@ export async function POST(request: Request) {
         const found = await db.select({ id: workoutLibraryItems.id }).from(workoutLibraryItems).where(inArray(workoutLibraryItems.id, linkedWorkoutIds));
         if (found.length !== new Set(linkedWorkoutIds).size) return apiError("Choose valid Workout Library items for linked progression steps.", 422);
       }
-      // Validate the whole track before changing its metadata or replacing
-      // steps, so a bad editor submission preserves the previous track.
+      // Validate the whole track before changing its metadata. Retained steps
+      // keep their durable IDs so planned/history sessions remain valid.
+      const previous = await db.select().from(progressionSteps).where(eq(progressionSteps.trackId, id));
+      const retained = new Set(rows.map((row) => row.id));
+      const removed = previous.filter((step) => !retained.has(step.id));
+      if (removed.length) {
+        const removedIds = removed.map((step) => step.id);
+        const [sharedUse, athleteUse] = await Promise.all([
+          db.select({ id: sharedSessions.id }).from(sharedSessions).where(inArray(sharedSessions.progressionStepId, removedIds)).limit(1),
+          db.select({ id: athleteSessions.id }).from(athleteSessions).where(inArray(athleteSessions.progressionStepId, removedIds)).limit(1),
+        ]);
+        if (sharedUse.length || athleteUse.length) return apiError("A progression step is linked to planned or historical training and cannot be deleted.", 409);
+        await db.delete(progressionSteps).where(inArray(progressionSteps.id, removedIds));
+      }
       if (existing) await db.update(progressionTracks).set({ name, purpose: asString(body.purpose), updatedAt: nowIso() }).where(eq(progressionTracks.id, id));
       else await db.insert(progressionTracks).values({ id, teamId: TEAM_ID, name, purpose: asString(body.purpose), isBuiltIn: false, active: true, updatedAt: nowIso() });
-      await db.delete(progressionSteps).where(eq(progressionSteps.trackId, id));
-      for (const batch of d1InsertBatches(rows)) await db.insert(progressionSteps).values(batch);
+      for (const [index, row] of rows.entries()) {
+        const current = previous.find((step) => step.id === row.id);
+        if (current) await db.update(progressionSteps).set({ workoutId: row.workoutId, title: row.title, prescription: row.prescription, sortOrder: index }).where(eq(progressionSteps.id, row.id));
+        else await db.insert(progressionSteps).values({ ...row, sortOrder: index });
+      }
       return Response.json({ ok: true, trackId: id });
     }
 
