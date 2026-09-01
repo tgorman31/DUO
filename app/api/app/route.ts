@@ -66,6 +66,7 @@ import { V2_HYROX_STATIONS } from "@/lib/v2-catalogue";
 import { categoryTotals } from "@/lib/training-logic";
 import { d1InsertBatches } from "@/lib/d1-limits";
 import { completeStrengthEntries } from "@/lib/strength-completion";
+import { completeProgressionForSession } from "@/lib/progression-completion";
 import { cloneStrengthTemplate } from "@/lib/strength-template";
 
 export const dynamic = "force-dynamic";
@@ -1765,38 +1766,8 @@ export async function POST(request: Request) {
         .update(plannedWeeks)
         .set({ status: "in_progress", updatedAt: nowIso() })
         .where(eq(plannedWeeks.id, sessionRow.weekId));
-      // Progression identity is written to the session at materialisation.
-      // Completion deliberately never infers an expected step from title text.
-      const plannedTrackId = sessionRow.progressionTrackId;
-      const plannedStepId = sessionRow.progressionStepId;
-      if (plannedTrackId && plannedStepId) {
-        const [track] = await db.select().from(progressionTracks).where(eq(progressionTracks.id, plannedTrackId)).limit(1);
-        const steps = track ? await db.select().from(progressionSteps).where(eq(progressionSteps.trackId, plannedTrackId)).orderBy(asc(progressionSteps.sortOrder)) : [];
-        const expectedIndex = steps.findIndex((step) => step.id === plannedStepId);
-        if (track && expectedIndex >= 0) {
-          const states = await db.select().from(progressionStatesV2).where(eq(progressionStatesV2.trackId, plannedTrackId));
-          const currentFor = (athleteId: string) => states.find((state) => state.athleteId === athleteId)?.currentStep ?? 0;
-          if (sessionRow.assignment === "together") {
-            const linked = sessionRow.sharedSessionId ? await db.select().from(athleteSessions).where(eq(athleteSessions.sharedSessionId, sessionRow.sharedSessionId)) : [];
-            const bothDone = ["thomas", "kt"].every((athleteId) => linked.some((row) => row.athleteId === athleteId && row.status === "completed" && row.progressionTrackId === plannedTrackId && row.progressionStepId === plannedStepId));
-            if (bothDone) {
-              const sharedNext = Math.min(expectedIndex + 1, steps.length);
-              for (const athleteId of ["thomas", "kt"]) {
-                const next = Math.max(currentFor(athleteId), sharedNext);
-                await db.insert(progressionStatesV2).values({ athleteId, trackId: plannedTrackId, currentStep: next, togetherPending: false, updatedAt: nowIso() }).onConflictDoUpdate({ target: [progressionStatesV2.athleteId, progressionStatesV2.trackId], set: { currentStep: next, togetherPending: false, updatedAt: nowIso() } });
-              }
-              progressionMessages.push(`${track.name}: completed by both${sharedNext >= steps.length ? " — progression complete" : " — next step ready"}`);
-            } else {
-              await db.insert(progressionStatesV2).values({ athleteId: actor.id, trackId: plannedTrackId, currentStep: Math.max(currentFor(actor.id), expectedIndex), togetherPending: true, updatedAt: nowIso() }).onConflictDoUpdate({ target: [progressionStatesV2.athleteId, progressionStatesV2.trackId], set: { currentStep: Math.max(currentFor(actor.id), expectedIndex), togetherPending: true, updatedAt: nowIso() } });
-              progressionMessages.push(`${track.name}: waiting for partner completion`);
-            }
-          } else if (currentFor(actor.id) === expectedIndex) {
-            const next = Math.min(expectedIndex + 1, steps.length);
-            await db.insert(progressionStatesV2).values({ athleteId: actor.id, trackId: plannedTrackId, currentStep: next, togetherPending: false, updatedAt: nowIso() }).onConflictDoUpdate({ target: [progressionStatesV2.athleteId, progressionStatesV2.trackId], set: { currentStep: next, togetherPending: false, updatedAt: nowIso() } });
-            progressionMessages.push(`${track.name}: ${next >= steps.length ? "progression complete" : "advanced to the next step"}`);
-          }
-        }
-      }
+      const progression = await completeProgressionForSession(db, sessionRow, actor.id);
+      if (progression.message) progressionMessages.push(progression.message);
       const paceNote = averagePace ? ` — ${averagePace}/km avg rep pace` : "";
       await createActivity(
         db,

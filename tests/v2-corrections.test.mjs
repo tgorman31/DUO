@@ -10,6 +10,7 @@ import * as schema from "../db/schema.ts";
 const { ensureSeeded, resetTrainingData, LEGACY_SLOT_FOCUS_MAP, LEGACY_CATALOGUE_ALIAS_MAP } = await import("../db/seed.ts");
 const { reconcileV2RecommendedWeek, applyWeekTypeToProgrammeWeek, setProgrammeWeekType } = await import("../db/week-planning.ts");
 const { completeStrengthEntries } = await import("../lib/strength-completion.ts");
+const { completeProgressionForSession } = await import("../lib/progression-completion.ts");
 const { cloneStrengthTemplate } = await import("../lib/strength-template.ts");
 const { exerciseAvailable } = await import("../lib/equipment.ts");
 
@@ -465,5 +466,37 @@ test("progression materialisation writes explicit track and step identities and 
     const [completed] = await db.select().from(schema.athleteSessions).where(and(eq(schema.athleteSessions.weekId, week.id), eq(schema.athleteSessions.sortOrder, 3), eq(schema.athleteSessions.athleteId, "thomas")));
     assert.equal(completed.progressionTrackId, null);
     assert.match(completed.title, /Progression complete/);
+  } finally { await miniflare.dispose(); }
+});
+
+test("progression completion service is idempotent, rejects wrong steps, and coordinates Together", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    const [week] = await db.select().from(schema.plannedWeeks).where(eq(schema.plannedWeeks.id, "week-2026-09-21"));
+    const intents = await db.select().from(schema.programmeWeekDayIntents).where(eq(schema.programmeWeekDayIntents.weekId, week.id));
+    await reconcileV2RecommendedWeek(db, week, intents, true, { sharedProgression: true });
+    let [thomas] = await db.select().from(schema.athleteSessions).where(and(eq(schema.athleteSessions.weekId, week.id), eq(schema.athleteSessions.athleteId, "thomas"), eq(schema.athleteSessions.sortOrder, 3)));
+    let [kt] = await db.select().from(schema.athleteSessions).where(and(eq(schema.athleteSessions.weekId, week.id), eq(schema.athleteSessions.athleteId, "kt"), eq(schema.athleteSessions.sortOrder, 3)));
+    await db.update(schema.athleteSessions).set({ status: "completed" }).where(eq(schema.athleteSessions.id, thomas.id));
+    const pending = await completeProgressionForSession(db, thomas, "thomas");
+    assert.equal(pending.pendingPartner, true);
+    let [state] = await db.select().from(schema.progressionStatesV2).where(and(eq(schema.progressionStatesV2.athleteId, "thomas"), eq(schema.progressionStatesV2.trackId, "track-lt2-running")));
+    assert.equal(state.currentStep, 0);
+    const replay = await completeProgressionForSession(db, thomas, "thomas");
+    assert.equal(replay.advanced, false);
+    await db.update(schema.athleteSessions).set({ status: "completed" }).where(eq(schema.athleteSessions.id, kt.id));
+    const advanced = await completeProgressionForSession(db, kt, "kt");
+    assert.equal(advanced.advanced, true);
+    state = (await db.select().from(schema.progressionStatesV2).where(and(eq(schema.progressionStatesV2.athleteId, "thomas"), eq(schema.progressionStatesV2.trackId, "track-lt2-running"))))[0];
+    assert.equal(state.currentStep, 1);
+    await db.update(schema.progressionStatesV2).set({ currentStep: 1 }).where(and(eq(schema.progressionStatesV2.athleteId, "thomas"), eq(schema.progressionStatesV2.trackId, "track-lt2-running")));
+    const wrong = await completeProgressionForSession(db, thomas, "thomas");
+    assert.equal(wrong.advanced, false);
+    await db.update(schema.progressionStatesV2).set({ currentStep: 2 }).where(and(eq(schema.progressionStatesV2.athleteId, "thomas"), eq(schema.progressionStatesV2.trackId, "track-lt2-running")));
+    await db.update(schema.progressionStatesV2).set({ currentStep: 0 }).where(and(eq(schema.progressionStatesV2.athleteId, "kt"), eq(schema.progressionStatesV2.trackId, "track-lt2-running")));
+    await completeProgressionForSession(db, thomas, "thomas");
+    await completeProgressionForSession(db, kt, "kt");
+    state = (await db.select().from(schema.progressionStatesV2).where(and(eq(schema.progressionStatesV2.athleteId, "thomas"), eq(schema.progressionStatesV2.trackId, "track-lt2-running"))))[0];
+    assert.equal(state.currentStep, 2, "Together completion must never regress an ahead athlete");
   } finally { await miniflare.dispose(); }
 });
