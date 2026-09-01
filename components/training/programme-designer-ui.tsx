@@ -191,11 +191,13 @@ function BlockEditor({
 function PhaseEditor({
   block,
   phase,
+  phases,
   mutate,
   onClose,
 }: {
   block: TrainingBlock;
   phase: Phase | null;
+  phases: Phase[];
   mutate: Mutate;
   onClose: () => void;
 }) {
@@ -208,6 +210,9 @@ function PhaseEditor({
     sortOrder: phase?.sortOrder ?? 0,
   });
   const [error, setError] = useState("");
+  const [splitPhaseId, setSplitPhaseId] = useState("");
+  const phaseIndex = phases.findIndex((item) => item.id === phase?.id);
+  const [absorbInto, setAbsorbInto] = useState<"previous" | "next">(phaseIndex > 0 ? "previous" : "next");
   const save = async () => {
     try {
       await mutate(
@@ -215,6 +220,7 @@ function PhaseEditor({
           action: phase ? "updatePhase" : "createPhase",
           phaseId: draft.id,
           blockId: block.id,
+          splitPhaseId: splitPhaseId || undefined,
           ...draft,
         },
         "Phase saved",
@@ -274,22 +280,33 @@ function PhaseEditor({
               }
             />
           </div>
+          {!phase ? (
+            <div className="field-stack">
+              <Label>Split an existing phase (optional)</Label>
+              <Select value={splitPhaseId || "none"} onValueChange={(value) => setSplitPhaseId(value === "none" ? "" : value)}>
+                <SelectTrigger><SelectValue placeholder="Add without splitting" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">Add without splitting</SelectItem>
+                  {phases.map((item) => <SelectItem key={item.id} value={item.id}>{item.name} · {item.startDate} → {item.endDate}</SelectItem>)}
+                </SelectContent>
+              </Select>
+              <small className="muted-copy">Splitting adjusts the existing boundary in the same save.</small>
+            </div>
+          ) : null}
         </div>
         {error ? <p className="editor-error" role="alert">{error}</p> : null}
         <DialogFooter>
           {phase ? (
-            <Button
-              variant="destructive"
-              onClick={async () => {
-                await mutate(
-                  { action: "deletePhase", phaseId: phase.id },
-                  "Phase removed",
-                );
-                onClose();
-              }}
-            >
-              Remove phase
-            </Button>
+            <>
+              <Select value={absorbInto} onValueChange={(value) => setAbsorbInto(value as "previous" | "next")}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {phaseIndex > 0 ? <SelectItem value="previous">Absorb into previous phase</SelectItem> : null}
+                  {phaseIndex < phases.length - 1 ? <SelectItem value="next">Absorb into next phase</SelectItem> : null}
+                </SelectContent>
+              </Select>
+              <Button variant="destructive" onClick={async () => { try { await mutate({ action: "deletePhase", phaseId: phase.id, absorbInto }, "Phase removed"); onClose(); } catch (mutationError) { setError(mutationError instanceof Error ? mutationError.message : "Phase could not be removed."); } }}>Remove phase</Button>
+            </>
           ) : null}
           <Button variant="outline" onClick={onClose}>
             Cancel
@@ -349,6 +366,7 @@ function WeekEditor({
     title: recommendation?.title ?? week.title,
     rationale: recommendation?.rationale ?? week.rationale,
   });
+  const [progressionTouched, setProgressionTouched] = useState(false);
   const [preview, setPreview] = useState<
     Array<{
       day: number;
@@ -363,15 +381,21 @@ function WeekEditor({
     week.planningState === "in_progress" ||
     week.planningState === "complete",
   );
+  const [snapshotState, setSnapshotState] = useState<"loading" | "available" | "unavailable">(locked ? "loading" : "available");
+  const [snapshotMeta, setSnapshotMeta] = useState<{ weekType?: string; phase?: string; progression?: string } | null>(null);
   const selectedType = data.v2.weekTypeTemplates.find(
     (item) => item.id === draft.weekTypeId,
   );
   useEffect(() => {
     if (!locked) return;
     void mutate({ action: "viewProgrammeSnapshot", weekId: week.id }).then((result) => {
-      const snapshot = result.snapshot as { materializedSessions?: Array<{ sortOrder?: number; title?: string; category?: string; locationId?: string | null }> } | undefined;
-      if (snapshot?.materializedSessions) setPreview(snapshot.materializedSessions.map((row) => ({ day: row.sortOrder ?? 0, title: row.title ?? "Rest / recovery", category: row.category, locationId: row.locationId })));
-    });
+      const snapshot = result.snapshot as { materializedSessions?: Array<{ sortOrder?: number; title?: string; category?: string; locationId?: string | null }>; recommendation?: { weekTypeId?: string; phaseId?: string | null; progressionTrackId?: string | null; qualityIntent?: string } } | undefined;
+      if (snapshot?.materializedSessions?.length === 7) {
+        setSnapshotState("available");
+        setPreview(snapshot.materializedSessions.map((row) => ({ day: row.sortOrder ?? 0, title: row.title ?? "Rest / recovery", category: row.category, locationId: row.locationId })));
+        setSnapshotMeta({ weekType: snapshot.recommendation?.weekTypeId, phase: snapshot.recommendation?.phaseId ?? undefined, progression: snapshot.recommendation?.qualityIntent || snapshot.recommendation?.progressionTrackId || undefined });
+      } else setSnapshotState("unavailable");
+    }).catch(() => setSnapshotState("unavailable"));
   }, [locked, mutate, week.id]);
   useEffect(() => {
     if (locked) return;
@@ -419,6 +443,9 @@ function WeekEditor({
             THIS WEEK HAS BEEN SET
             <br />
             Use Week to modify the live plan.
+            {snapshotState === "available" && snapshotMeta ? (
+              <><br /><small>Saved recommendation · {snapshotMeta.weekType ?? "Week Type"} · {snapshotMeta.phase ?? "phase preserved"} · {snapshotMeta.progression ?? "no progression"}</small></>
+            ) : null}
           </p>
         ) : (
           <div className="dialog-form-grid">
@@ -426,13 +453,14 @@ function WeekEditor({
               <Label>Week Type</Label>
               <Select
                 value={draft.weekTypeId}
-                onValueChange={(value) =>
+                onValueChange={(value) => {
                   setDraft({
                     ...draft,
                     weekTypeId: value,
                     progressionTrackId: "",
-                  })
-                }
+                  });
+                  setProgressionTouched(false);
+                }}
               >
                 <SelectTrigger>
                   <SelectValue />
@@ -474,12 +502,13 @@ function WeekEditor({
                 <Label>Quality progression</Label>
                 <Select
                   value={draft.progressionTrackId || "none"}
-                  onValueChange={(value) =>
+                  onValueChange={(value) => {
                     setDraft({
                       ...draft,
                       progressionTrackId: value === "none" ? "" : value,
-                    })
-                  }
+                    });
+                    setProgressionTouched(true);
+                  }}
                 >
                   <SelectTrigger>
                     <SelectValue placeholder="None" />
@@ -518,7 +547,7 @@ function WeekEditor({
             </div>
           </div>
         )}
-        {<WeekPreview days={preview.length ? preview : fallbackPreview} />}
+        {!locked ? <WeekPreview days={preview.length ? preview : fallbackPreview} /> : snapshotState === "available" ? <WeekPreview days={preview} /> : <p className="editor-error" role="status">Historical programme snapshot unavailable</p>}
         {error ? <p className="editor-error" role="alert">{error}</p> : null}
         <DialogFooter>
           {!locked ? (
@@ -526,7 +555,7 @@ function WeekEditor({
               onClick={async () => {
                 try {
                   await mutate(
-                    { action: "updateProgrammeWeek", weekId: week.id, ...draft },
+                    { action: "updateProgrammeWeek", weekId: week.id, ...draft, progressionIsOverride: progressionTouched || Boolean(recommendation?.progressionIsOverride) },
                     "Programme week saved",
                   );
                   onClose();
@@ -994,6 +1023,7 @@ function DuplicateDialog({
   onDuplicated: (template: AppData["v2"]["weekTypeTemplates"][number]) => void;
 }) {
   const [name, setName] = useState(`${template.name} copy`);
+  const [error, setError] = useState("");
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="training-dialog" mode="responsive-editor">
@@ -1011,6 +1041,7 @@ function DuplicateDialog({
             onChange={(event) => setName(event.target.value)}
           />
         </div>
+        {error ? <p className="editor-error" role="alert">{error}</p> : null}
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>
             Cancel
@@ -1018,23 +1049,11 @@ function DuplicateDialog({
           <Button
             disabled={!name.trim()}
             onClick={async () => {
-              const result = await mutate(
-                {
-                  action: "duplicateWeekType",
-                  templateId: template.id,
-                  name: name.trim(),
-                },
-                "Week Type duplicated",
-              );
-              if (typeof result.templateId === "string")
-                onDuplicated({
-                  ...template,
-                  id: result.templateId,
-                  name: name.trim(),
-                  isBuiltIn: false,
-                  active: true,
-                });
-              onClose();
+              try {
+                const result = await mutate({ action: "duplicateWeekType", templateId: template.id, name: name.trim() }, "Week Type duplicated");
+                if (typeof result.templateId === "string") onDuplicated({ ...template, id: result.templateId, name: name.trim(), isBuiltIn: false, active: true });
+                onClose();
+              } catch (mutationError) { setError(mutationError instanceof Error ? mutationError.message : "Week Type could not be duplicated."); }
             }}
           >
             Duplicate
@@ -1072,6 +1091,9 @@ export function ProgrammeDesignerUI({
     AppData["v2"]["weekTypeTemplates"][number] | null
   >(null);
   const [propagationImpact, setPropagationImpact] = useState<{ eligibleCount: number; protectedCount: number; conflicts: string[] } | null>(null);
+  const [actionError, setActionError] = useState("");
+  const [resetError, setResetError] = useState("");
+  const [propagationError, setPropagationError] = useState("");
   const phases = useMemo(
     () =>
       [...data.phases].sort((a, b) => a.startDate.localeCompare(b.startDate)),
@@ -1218,7 +1240,7 @@ export function ProgrammeDesignerUI({
                   week.planningState === "in_progress" ||
                   week.planningState === "complete",
                 );
-                const statusLabel = week.confirmedAt ? "SET" : week.planningState === "complete" ? "COMPLETE" : week.planningState === "in_progress" ? "IN PROGRESS" : "FUTURE";
+                const statusLabel = week.planningState === "complete" ? "COMPLETE" : week.planningState === "in_progress" ? "IN PROGRESS" : week.confirmedAt ? "SET" : "FUTURE";
                 const phase = data.phases.find(
                   (item) => item.id === rec?.phaseId,
                 );
@@ -1272,10 +1294,14 @@ export function ProgrammeDesignerUI({
                 <h2>Week Types</h2>
               </div>
               <Button size="sm" onClick={async () => {
-                const result = await mutate({ action: "createWeekType", name: "New Week Type" }, "Week Type created");
-                if (typeof result.templateId === "string") setEditingType({ id: result.templateId, name: "New Week Type", rationale: "", hardTarget: 0, strengthTarget: 0, easyTarget: 0, defaultLocationId: null, priorityEmphasis: "balanced", isBuiltIn: false, active: true, intents: dayNames.map((_, day) => ({ id: `${result.templateId}-${day}`, day, intent: "Rest / recovery", workoutId: null, strengthTemplateId: null, progressionTrackId: null, locationId: null, priorityEmphasis: "balanced", category: "recovery", workoutKind: "recovery", details: "", isQualityIntent: false })) });
+                try {
+                  setActionError("");
+                  const result = await mutate({ action: "createWeekType", name: "New Week Type" }, "Week Type created");
+                  if (typeof result.templateId === "string") setEditingType({ id: result.templateId, name: "New Week Type", rationale: "", hardTarget: 0, strengthTarget: 0, easyTarget: 0, defaultLocationId: null, priorityEmphasis: "balanced", isBuiltIn: false, active: true, intents: dayNames.map((_, day) => ({ id: `${result.templateId}-${day}`, day, intent: "Rest / recovery", workoutId: null, strengthTemplateId: null, progressionTrackId: null, locationId: null, priorityEmphasis: "balanced", category: "recovery", workoutKind: "recovery", details: "", isQualityIntent: false })) });
+                } catch (error) { setActionError(error instanceof Error ? error.message : "Week Type could not be created."); }
               }}>+ New Week Type</Button>
             </div>
+            {actionError ? <p className="editor-error" role="alert">{actionError}</p> : null}
             <div className="programme-template-list">
               {data.v2.weekTypeTemplates.map((template) => (
                 <article className="programme-template-card" key={template.id}>
@@ -1405,6 +1431,7 @@ export function ProgrammeDesignerUI({
         <PhaseEditor
           block={data.block}
           phase={phaseEditor}
+          phases={phases}
           mutate={mutate}
           onClose={() => setPhaseEditor(false)}
         />
@@ -1478,9 +1505,10 @@ export function ProgrammeDesignerUI({
               <DialogDescription>This restores the original DUO base Week Type. Set and completed weeks will not change.</DialogDescription>
             </DialogHeader>
             <p className="muted-panel">Future unset programme weeks are not changed unless you explicitly choose to update them.</p>
+            {resetError ? <p className="editor-error" role="alert">{resetError}</p> : null}
             <DialogFooter>
               <Button variant="outline" onClick={() => setResetTemplate(null)}>Cancel</Button>
-              <Button onClick={async () => { await mutate({ action: "resetWeekTypeTemplate", templateId: resetTemplate.id }, "Week Type reset to DUO base"); setResetTemplate(null); setPropagationTemplate(resetTemplate.id); }}>Reset to DUO base</Button>
+              <Button onClick={async () => { try { setResetError(""); await mutate({ action: "resetWeekTypeTemplate", templateId: resetTemplate.id }, "Week Type reset to DUO base"); setResetTemplate(null); setPropagationTemplate(resetTemplate.id); } catch (error) { setResetError(error instanceof Error ? error.message : "Week Type could not be reset."); } }}>Reset to DUO base</Button>
             </DialogFooter>
           </DialogContent>
         </Dialog>
@@ -1504,6 +1532,7 @@ export function ProgrammeDesignerUI({
               explicitly apply the new template to eligible future unset weeks.
             </p>
             {propagationImpact?.conflicts.length ? <p className="muted-panel">{propagationImpact.conflicts.length} week{propagationImpact.conflicts.length === 1 ? "" : "s"} have an explicit progression that needs manual review and will be protected.</p> : null}
+            {propagationError ? <p className="editor-error" role="alert">{propagationError}</p> : null}
             <DialogFooter>
               <Button
                 variant="outline"
@@ -1513,14 +1542,11 @@ export function ProgrammeDesignerUI({
               </Button>
               <Button
                 onClick={async () => {
-                  await mutate(
-                    {
-                      action: "updateFutureWeeksFromWeekType",
-                      templateId: propagationTemplate,
-                    },
-                    `Updated ${propagationImpact?.eligibleCount ?? eligibleCount} future week${(propagationImpact?.eligibleCount ?? eligibleCount) === 1 ? "" : "s"}`,
-                  );
-                  setPropagationTemplate(null);
+                  try {
+                    setPropagationError("");
+                    await mutate({ action: "updateFutureWeeksFromWeekType", templateId: propagationTemplate }, `Updated ${propagationImpact?.eligibleCount ?? eligibleCount} future week${(propagationImpact?.eligibleCount ?? eligibleCount) === 1 ? "" : "s"}`);
+                    setPropagationTemplate(null);
+                  } catch (error) { setPropagationError(error instanceof Error ? error.message : "Future programme weeks could not be updated."); }
                 }}
               >
                 Update future weeks

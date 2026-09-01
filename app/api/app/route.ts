@@ -69,6 +69,14 @@ import { d1InsertBatches } from "@/lib/d1-limits";
 import { completeStrengthEntries } from "@/lib/strength-completion";
 import { completeProgressionForSession } from "@/lib/progression-completion";
 import { cloneStrengthTemplate } from "@/lib/strength-template";
+import {
+  phaseCoverageError,
+  hasExplicitProgressionConflict,
+  proposeBoundaryEdit,
+  proposeBlockDateChange,
+  proposePhaseAbsorption,
+  proposePhaseSplit,
+} from "@/db/programme-structure";
 
 export const dynamic = "force-dynamic";
 
@@ -107,23 +115,6 @@ const validTitleBarColors = new Set([
 
 function apiError(message: string, status = 400) {
   return Response.json({ error: message }, { status });
-}
-
-function nextIsoDate(value: string) {
-  const date = new Date(`${value}T00:00:00Z`);
-  date.setUTCDate(date.getUTCDate() + 1);
-  return date.toISOString().slice(0, 10);
-}
-
-function phaseCoverageError(phases: Array<{ startDate: string; endDate: string }>, block: { startDate: string; endDate: string }) {
-  const ordered = [...phases].sort((a, b) => a.startDate.localeCompare(b.startDate));
-  if (!ordered.length) return "At least one phase is required to cover the training block.";
-  if (ordered[0].startDate !== block.startDate) return `Programme phases leave ${block.startDate}–${nextIsoDate(ordered[0].startDate)} uncovered.`;
-  for (let index = 1; index < ordered.length; index += 1) {
-    if (ordered[index].startDate !== nextIsoDate(ordered[index - 1].endDate)) return `Programme phases leave ${nextIsoDate(ordered[index - 1].endDate)}–${nextIsoDate(ordered[index].startDate)} uncovered.`;
-  }
-  if (ordered.at(-1)?.endDate !== block.endDate) return `Programme phases leave ${nextIsoDate(ordered.at(-1)?.endDate ?? block.startDate)}–${block.endDate} uncovered.`;
-  return null;
 }
 
 function asString(value: unknown, fallback = "") {
@@ -2263,17 +2254,16 @@ export async function POST(request: Request) {
       const templateId = asString(body.templateId);
       const [template] = await db.select({ id: weekTypeTemplates.id }).from(weekTypeTemplates).where(eq(weekTypeTemplates.id, templateId)).limit(1);
       if (!template) return apiError("Week Type not found.", 404);
-      const recommendations = await db.select({ weekId: programmeWeekRecommendations.weekId }).from(programmeWeekRecommendations).where(eq(programmeWeekRecommendations.weekTypeId, templateId));
+      const recommendations = await db.select({ weekId: programmeWeekRecommendations.weekId, progressionTrackId: programmeWeekRecommendations.progressionTrackId, progressionIsOverride: programmeWeekRecommendations.progressionIsOverride }).from(programmeWeekRecommendations).where(eq(programmeWeekRecommendations.weekTypeId, templateId));
       const weeks = recommendations.length ? await db.select().from(plannedWeeks).where(inArray(plannedWeeks.id, recommendations.map((row) => row.weekId))) : [];
       const candidates = weeks.filter((week) => week.startDate >= todayIso() && !week.confirmedAt && !["in_progress", "complete"].includes(week.status));
       const eligible = [] as typeof candidates;
       const protectedWeeks = weeks.filter((week) => !candidates.some((item) => item.id === week.id));
       const conflicts: string[] = [];
       for (const week of candidates) {
-        const intents = await db.select().from(programmeWeekDayIntents).where(eq(programmeWeekDayIntents.weekId, week.id));
         const templateIntents = await db.select().from(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, templateId));
-        const hasExplicitProgression = intents.some((intent) => intent.isProgrammeOverride && Boolean(intent.progressionTrackId));
-        if (hasExplicitProgression && !templateIntents.some((intent) => intent.isQualityIntent)) conflicts.push(week.id);
+        const recommendation = recommendations.find((row) => row.weekId === week.id);
+        if (hasExplicitProgressionConflict(recommendation, templateIntents)) conflicts.push(week.id);
         else eligible.push(week);
       }
       return Response.json({ ok: true, eligibleWeekIds: eligible.map((week) => week.id), eligibleCount: eligible.length, protectedCount: protectedWeeks.length, conflicts });
@@ -2289,9 +2279,8 @@ export async function POST(request: Request) {
       const templateIntents = await db.select().from(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, templateId));
       const eligible = [] as typeof candidates;
       for (const week of candidates) {
-        const intents = await db.select().from(programmeWeekDayIntents).where(eq(programmeWeekDayIntents.weekId, week.id));
-        const hasExplicitProgression = intents.some((intent) => intent.isProgrammeOverride && Boolean(intent.progressionTrackId));
-        if (hasExplicitProgression && !templateIntents.some((intent) => intent.isQualityIntent)) continue;
+        const recommendation = recommendations.find((row) => row.weekId === week.id);
+        if (hasExplicitProgressionConflict(recommendation, templateIntents)) continue;
         eligible.push(week);
       }
       for (const week of eligible) await applyWeekTypeTemplatePropagation(db, week.id, templateId);
@@ -2304,8 +2293,13 @@ export async function POST(request: Request) {
       if (!week) return apiError("Programme week not found.", 404);
       if (week.confirmedAt || week.status === "in_progress") return apiError("Set or in-progress weeks require normal Week editing.", 409);
       const previousRecommendation = await db.select().from(programmeWeekRecommendations).where(eq(programmeWeekRecommendations.weekId, weekId)).limit(1).then((rows) => rows[0]);
-      const recommendation = { title: asString(body.title, week.title), rationale: asString(body.rationale, week.rationale), qualityIntent: asString(body.qualityIntent, week.qualityFocus), weekTypeId: asString(body.weekTypeId) || null, phaseId: asString(body.phaseId) || null, progressionTrackId: asString(body.progressionTrackId) || null };
-      if (recommendation.weekTypeId && recommendation.weekTypeId !== previousRecommendation?.weekTypeId) await setProgrammeWeekType(db, weekId, recommendation.weekTypeId);
+      const progressionWasSubmitted = Object.prototype.hasOwnProperty.call(body, "progressionIsOverride");
+      let recommendation = { title: asString(body.title, week.title), rationale: asString(body.rationale, week.rationale), qualityIntent: asString(body.qualityIntent, week.qualityFocus), weekTypeId: asString(body.weekTypeId) || null, phaseId: asString(body.phaseId) || null, progressionTrackId: asString(body.progressionTrackId) || null, progressionIsOverride: progressionWasSubmitted ? Boolean(body.progressionIsOverride) : Boolean(previousRecommendation?.progressionIsOverride) };
+      const weekTypeChanged = Boolean(recommendation.weekTypeId && recommendation.weekTypeId !== previousRecommendation?.weekTypeId);
+      if (weekTypeChanged && recommendation.weekTypeId) {
+        await setProgrammeWeekType(db, weekId, recommendation.weekTypeId);
+        recommendation = { ...recommendation, progressionTrackId: null, progressionIsOverride: false, qualityIntent: "" };
+      }
       const legacyWeekType = recommendation.weekTypeId?.startsWith("week-type-") ? recommendation.weekTypeId.slice("week-type-".length) : week.weekType;
       await db.update(plannedWeeks).set({ title: recommendation.title, rationale: recommendation.rationale, qualityFocus: recommendation.qualityIntent, weekType: legacyWeekType, programmeWeekTypeId: recommendation.weekTypeId, programmePhaseId: recommendation.phaseId, updatedAt: nowIso() }).where(eq(plannedWeeks.id, weekId));
       await db.insert(programmeWeekRecommendations).values({ id: `programme-recommendation-${weekId}`, weekId, ...recommendation, updatedAt: nowIso() }).onConflictDoUpdate({ target: programmeWeekRecommendations.weekId, set: { ...recommendation, updatedAt: nowIso() } });
@@ -2473,12 +2467,17 @@ export async function POST(request: Request) {
       const startDate = asString(body.startDate, block.startDate);
       const endDate = asString(body.endDate, block.endDate);
       if (!asString(body.name, block.name) || startDate > endDate) return apiError("Block name and valid dates are required.");
-      const phasesOutside = await db.select().from(trainingPhases).where(and(eq(trainingPhases.blockId, blockId), sql`${trainingPhases.startDate} < ${startDate} or ${trainingPhases.endDate} > ${endDate}`));
-      if (phasesOutside.length) return apiError("Update the affected phase dates before shortening this block.", 409);
       const phases = await db.select().from(trainingPhases).where(eq(trainingPhases.blockId, blockId));
-      const coverageError = phaseCoverageError(phases, { startDate, endDate });
-      if (coverageError) return apiError(coverageError, 422);
-      await db.update(trainingBlocks).set({ name: asString(body.name, block.name), startDate, endDate, trainingGoal: asString(body.trainingGoal, block.trainingGoal), notes: asString(body.notes, block.notes) }).where(eq(trainingBlocks.id, blockId));
+      let proposed;
+      try { proposed = proposeBlockDateChange(phases, block, { startDate, endDate }); } catch (error) { return apiError(error instanceof Error ? error.message : "Block dates could not be changed.", 422); }
+      const protectedWeeks = await db.select().from(plannedWeeks).where(and(eq(plannedWeeks.blockId, blockId), sql`${plannedWeeks.confirmedAt} is not null or ${plannedWeeks.status} in ('in_progress', 'complete')`));
+      for (const week of protectedWeeks) {
+        const oldPhase = phases.find((phase) => phase.startDate <= week.startDate && phase.endDate >= week.startDate);
+        const nextPhase = proposed.find((phase) => phase.startDate <= week.startDate && phase.endDate >= week.startDate);
+        if (oldPhase?.id !== nextPhase?.id) return apiError("The block boundary would move a Set or historical week. Adjust only future coverage.", 409);
+      }
+      const statements: unknown[] = [db.update(trainingBlocks).set({ name: asString(body.name, block.name), startDate, endDate, trainingGoal: asString(body.trainingGoal, block.trainingGoal), notes: asString(body.notes, block.notes) }).where(eq(trainingBlocks.id, blockId)), ...proposed.map((phase) => db.update(trainingPhases).set({ startDate: phase.startDate, endDate: phase.endDate, sortOrder: phase.sortOrder ?? 0 }).where(eq(trainingPhases.id, phase.id)))];
+      await db.batch(statements as never);
       return Response.json({ ok: true });
     }
 
@@ -2492,25 +2491,30 @@ export async function POST(request: Request) {
       const startDate = asString(body.startDate, existing?.startDate ?? "");
       const endDate = asString(body.endDate, existing?.endDate ?? "");
       if (!name || !startDate || !endDate || startDate > endDate || startDate < block.startDate || endDate > block.endDate) return apiError("Use valid phase dates inside the training block.");
-      const overlapping = await db.select().from(trainingPhases).where(and(eq(trainingPhases.blockId, blockId), sql`${trainingPhases.startDate} <= ${endDate} and ${trainingPhases.endDate} >= ${startDate}`));
-      if (overlapping.some((phase) => phase.id !== existing?.id)) return apiError("Phase dates cannot overlap another phase.", 409);
       const id = existing?.id ?? `phase-${crypto.randomUUID()}`;
-      const values = { blockId, name, startDate, endDate, focus: asString(body.focus, existing?.focus ?? ""), sortOrder: Math.max(0, Math.round(asNumber(body.sortOrder, existing?.sortOrder ?? (await db.select({ count: sql<number>`count(*)` }).from(trainingPhases).where(eq(trainingPhases.blockId, blockId)))[0]?.count ?? 0) ?? 0)) };
-      if (existing) await db.update(trainingPhases).set(values).where(eq(trainingPhases.id, id)); else await db.insert(trainingPhases).values({ id, ...values });
-      const allPhases = await db.select().from(trainingPhases).where(eq(trainingPhases.blockId, blockId));
-      const coverageError = phaseCoverageError(allPhases, block);
-      if (coverageError) {
-        if (existing) await db.update(trainingPhases).set({ name: existing.name, startDate: existing.startDate, endDate: existing.endDate, focus: existing.focus, sortOrder: existing.sortOrder }).where(eq(trainingPhases.id, id));
-        else await db.delete(trainingPhases).where(eq(trainingPhases.id, id));
-        return apiError(coverageError, 422);
+      const currentPhases = await db.select().from(trainingPhases).where(eq(trainingPhases.blockId, blockId));
+      let proposed;
+      try {
+        if (!existing && asString(body.splitPhaseId)) proposed = proposePhaseSplit(currentPhases, block, asString(body.splitPhaseId), startDate, endDate, { id, blockId, name, focus: asString(body.focus) });
+        else if (existing) proposed = proposeBoundaryEdit(currentPhases, block, id, startDate, endDate).map((item) => item.id === id ? { ...item, name, focus: asString(body.focus, existing.focus) } : item);
+        else {
+          proposed = [...currentPhases, { id, blockId, name, startDate, endDate, focus: asString(body.focus), sortOrder: currentPhases.length }].sort((a, b) => a.startDate.localeCompare(b.startDate)).map((item, index) => ({ ...item, sortOrder: index }));
+          const coverageError = phaseCoverageError(proposed, block);
+          if (coverageError) throw new Error(coverageError);
+        }
+      } catch (error) { return apiError(error instanceof Error ? error.message : "Phase could not be changed.", 422); }
+      const protectedWeeks = await db.select().from(plannedWeeks).where(and(eq(plannedWeeks.blockId, blockId), sql`${plannedWeeks.confirmedAt} is not null or ${plannedWeeks.status} in ('in_progress', 'complete')`));
+      for (const week of protectedWeeks) {
+        const oldPhase = currentPhases.find((item) => item.startDate <= week.startDate && item.endDate >= week.startDate);
+        const nextPhase = proposed.find((item) => item.startDate <= week.startDate && item.endDate >= week.startDate);
+        if (oldPhase?.id !== nextPhase?.id) return apiError("This change would move a Set or historical week to another phase.", 409);
       }
-      // Phase dates are the programme order. Recalculate only editable future
-      // recommendations, never snapshots or historical weeks.
-      const phases = allPhases.sort((a, b) => a.startDate.localeCompare(b.startDate));
-      for (const [index, phase] of phases.entries()) await db.update(trainingPhases).set({ sortOrder: index }).where(eq(trainingPhases.id, phase.id));
+      const statements: unknown[] = proposed.map((item) => db.update(trainingPhases).set({ name: item.name, startDate: item.startDate, endDate: item.endDate, focus: item.focus ?? "", sortOrder: item.sortOrder ?? 0 }).where(eq(trainingPhases.id, item.id)));
+      if (!existing) statements.push(db.insert(trainingPhases).values({ id, blockId, name, startDate, endDate, focus: asString(body.focus), sortOrder: proposed.find((item) => item.id === id)?.sortOrder ?? 0 }));
+      await db.batch(statements as never);
       const futureWeeks = await db.select().from(plannedWeeks).where(and(eq(plannedWeeks.blockId, blockId), isNull(plannedWeeks.confirmedAt), sql`${plannedWeeks.status} not in ('in_progress', 'complete')`));
       for (const week of futureWeeks) {
-        const resolved = phases.find((phase) => phase.startDate <= week.startDate && phase.endDate >= week.startDate) ?? null;
+        const resolved = proposed.find((phase) => phase.startDate <= week.startDate && phase.endDate >= week.startDate) ?? null;
         await db.update(programmeWeekRecommendations).set({ phaseId: resolved?.id ?? null, updatedAt: nowIso() }).where(eq(programmeWeekRecommendations.weekId, week.id));
         await db.update(plannedWeeks).set({ programmePhaseId: resolved?.id ?? null, updatedAt: nowIso() }).where(eq(plannedWeeks.id, week.id));
       }
@@ -2521,18 +2525,31 @@ export async function POST(request: Request) {
       const phaseId = asString(body.phaseId);
       const [phase] = await db.select().from(trainingPhases).where(eq(trainingPhases.id, phaseId)).limit(1);
       if (!phase) return apiError("Phase not found.", 404);
-      const protectedWeeks = await db.select().from(plannedWeeks).where(and(eq(plannedWeeks.blockId, phase.blockId), sql`${plannedWeeks.startDate} between ${phase.startDate} and ${phase.endDate}`, sql`${plannedWeeks.confirmedAt} is not null or ${plannedWeeks.status} in ('in_progress', 'complete')`));
-      if (protectedWeeks.length) return apiError("This phase contains Set or historical weeks. Reassign eligible future weeks instead.", 409);
-      const remaining = await db.select().from(trainingPhases).where(and(eq(trainingPhases.blockId, phase.blockId), sql`${trainingPhases.id} != ${phase.id}`));
       const [block] = await db.select().from(trainingBlocks).where(eq(trainingBlocks.id, phase.blockId)).limit(1);
-      if (block) {
-        const coverageError = phaseCoverageError(remaining, block);
-        if (coverageError) return apiError(coverageError, 422);
+      if (!block) return apiError("Training block not found.", 404);
+      const allPhases = await db.select().from(trainingPhases).where(eq(trainingPhases.blockId, phase.blockId));
+      const absorbInto = asString(body.absorbInto) as "previous" | "next";
+      if (absorbInto !== "previous" && absorbInto !== "next") return apiError("Choose whether the date range should be absorbed by the previous or next phase.", 422);
+      let proposed;
+      try { proposed = proposePhaseAbsorption(allPhases, block, phaseId, absorbInto); } catch (error) { return apiError(error instanceof Error ? error.message : "Phase could not be removed.", 422); }
+      const protectedWeeks = await db.select().from(plannedWeeks).where(and(eq(plannedWeeks.blockId, phase.blockId), sql`${plannedWeeks.confirmedAt} is not null or ${plannedWeeks.status} in ('in_progress', 'complete')`));
+      for (const week of protectedWeeks) {
+        const oldPhase = allPhases.find((item) => item.startDate <= week.startDate && item.endDate >= week.startDate);
+        const nextPhase = proposed.find((item) => item.startDate <= week.startDate && item.endDate >= week.startDate);
+        if (oldPhase?.id !== nextPhase?.id) return apiError("This phase contains Set or historical weeks and cannot be removed.", 409);
       }
-      await db.update(programmeWeekRecommendations).set({ phaseId: null, updatedAt: nowIso() }).where(eq(programmeWeekRecommendations.phaseId, phaseId));
-      await db.delete(trainingPhases).where(eq(trainingPhases.id, phaseId));
-      const remainingAfterDelete = await db.select().from(trainingPhases).where(eq(trainingPhases.blockId, phase.blockId)).orderBy(asc(trainingPhases.startDate));
-      for (const [index, item] of remainingAfterDelete.entries()) await db.update(trainingPhases).set({ sortOrder: index }).where(eq(trainingPhases.id, item.id));
+      const orderedAll = [...allPhases].sort((a, b) => a.startDate.localeCompare(b.startDate));
+      const removedIndex = orderedAll.findIndex((item) => item.id === phaseId);
+      const targetPhaseId = orderedAll[absorbInto === "previous" ? removedIndex - 1 : removedIndex + 1]?.id;
+      if (!targetPhaseId) return apiError("Choose an adjacent phase to absorb this date range.", 422);
+      const statements: unknown[] = [
+        db.update(plannedWeeks).set({ programmePhaseId: targetPhaseId, updatedAt: nowIso() }).where(eq(plannedWeeks.programmePhaseId, phaseId)),
+        db.update(programmeWeekRecommendations).set({ phaseId: targetPhaseId, updatedAt: nowIso() }).where(eq(programmeWeekRecommendations.phaseId, phaseId)),
+        db.delete(trainingPhases).where(eq(trainingPhases.id, phaseId)),
+        ...proposed.map((item) => db.update(trainingPhases).set({ startDate: item.startDate, endDate: item.endDate, sortOrder: item.sortOrder ?? 0 }).where(eq(trainingPhases.id, item.id))),
+      ];
+      await db.batch(statements as never);
+      const remainingAfterDelete = proposed;
       const futureWeeks = await db.select().from(plannedWeeks).where(and(eq(plannedWeeks.blockId, phase.blockId), isNull(plannedWeeks.confirmedAt), sql`${plannedWeeks.status} not in ('in_progress', 'complete')`));
       for (const week of futureWeeks) {
         const resolved = remainingAfterDelete.find((item) => item.startDate <= week.startDate && item.endDate >= week.startDate) ?? null;

@@ -429,6 +429,7 @@ export const programmeWeekRecommendations = sqliteTable("programme_week_recommen
   phaseId: text("phase_id").references(() => trainingPhases.id),
   weekTypeId: text("week_type_id").references(() => weekTypeTemplates.id),
   progressionTrackId: text("progression_track_id").references(() => progressionTracks.id),
+  progressionIsOverride: integer("progression_is_override", { mode: "boolean" }).notNull().default(false),
   title: text("title").notNull().default(""),
   rationale: text("rationale").notNull().default(""),
   qualityIntent: text("quality_intent").notNull().default(""),

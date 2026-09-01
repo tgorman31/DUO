@@ -656,7 +656,7 @@ export async function ensureSeeded(db: TrainingDb) {
   await ensureV2Data(db);
   await db
     .insert(appMetadata)
-    .values({ key: "data-version", value: "2.0", updatedAt: new Date().toISOString() })
+    .values({ key: "data-version", value: "2.3", updatedAt: new Date().toISOString() })
     .onConflictDoNothing();
 }
 

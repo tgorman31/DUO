@@ -118,6 +118,7 @@ export async function setProgrammeWeekType(db: TrainingDb, weekId: string, weekT
       weekTypeId: template.id,
       phaseId: null,
       progressionTrackId: null,
+      progressionIsOverride: false,
       title: template.name,
       rationale: template.rationale,
       qualityIntent: "",
@@ -128,6 +129,7 @@ export async function setProgrammeWeekType(db: TrainingDb, weekId: string, weekT
       set: {
         weekTypeId: template.id,
         progressionTrackId: null,
+        progressionIsOverride: false,
         title: template.name,
         rationale: template.rationale,
         qualityIntent: "",

@@ -374,6 +374,7 @@ export type ProgrammeRecommendation = {
   phaseId: string | null;
   weekTypeId: string | null;
   progressionTrackId: string | null;
+  progressionIsOverride: boolean;
   title: string;
   rationale: string;
   qualityIntent: string;

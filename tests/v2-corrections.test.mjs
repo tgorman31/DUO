@@ -13,6 +13,7 @@ const { completeStrengthEntries } = await import("../lib/strength-completion.ts"
 const { completeProgressionForSession } = await import("../lib/progression-completion.ts");
 const { cloneStrengthTemplate } = await import("../lib/strength-template.ts");
 const { exerciseAvailable } = await import("../lib/equipment.ts");
+const { proposePhaseSplit, proposePhaseAbsorption, proposeBoundaryEdit, proposeBlockDateChange, phaseCoverageError, hasExplicitProgressionConflict } = await import("../db/programme-structure.ts");
 
 async function applyMigrations(binding) {
   const directory = new URL("../drizzle/", import.meta.url);
@@ -543,4 +544,80 @@ test("template propagation updates derived intents while preserving programme ov
     assert.equal(rows.find((row) => row.day === 0)?.intent, "Race-specific override");
     assert.equal(rows.find((row) => row.day === 1)?.intent, "Updated template intent");
   } finally { await miniflare.dispose(); }
+});
+
+test("phase CRUD proposals split, absorb, and move boundaries without gaps", () => {
+  const block = { startDate: "2026-09-21", endDate: "2026-10-18" };
+  const phases = [
+    { id: "phase-rebuild", name: "Rebuild", startDate: "2026-09-21", endDate: "2026-10-18", blockId: "block-test" },
+  ];
+  const split = proposePhaseSplit(phases, block, "phase-rebuild", "2026-10-12", "2026-10-18", { name: "Transition", blockId: "block-test" });
+  assert.equal(split.find((phase) => phase.id === "phase-rebuild")?.endDate, "2026-10-11");
+  assert.equal(phaseCoverageError(split, block), null);
+  const absorbedPrevious = proposePhaseAbsorption(split, block, split.find((phase) => phase.name === "Transition").id, "previous");
+  assert.equal(absorbedPrevious.length, 1);
+  assert.equal(absorbedPrevious[0].endDate, block.endDate);
+  const threePhases = [
+    { id: "p-before", name: "Before", startDate: "2026-09-21", endDate: "2026-09-27" },
+    { id: "p-middle", name: "Middle", startDate: "2026-09-28", endDate: "2026-10-04" },
+    { id: "p-after", name: "After", startDate: "2026-10-05", endDate: "2026-10-18" },
+  ];
+  const absorbedNext = proposePhaseAbsorption(threePhases, block, "p-middle", "next");
+  assert.equal(absorbedNext.length, 2);
+  assert.equal(absorbedNext.find((phase) => phase.id === "p-after").startDate, "2026-09-28");
+  const adjacent = [
+    { id: "p1", name: "Build", startDate: "2026-09-21", endDate: "2026-10-04" },
+    { id: "p2", name: "Specific", startDate: "2026-10-05", endDate: "2026-10-18" },
+  ];
+  const moved = proposeBoundaryEdit(adjacent, block, "p1", "2026-09-21", "2026-09-28");
+  assert.equal(moved.find((phase) => phase.id === "p2").startDate, "2026-09-29");
+  assert.equal(phaseCoverageError(moved, block), null);
+});
+
+test("block date proposals extend or trim the outer phase atomically", () => {
+  const phases = [
+    { id: "p1", name: "Foundation", startDate: "2026-09-21", endDate: "2026-10-04" },
+    { id: "p2", name: "Build", startDate: "2026-10-05", endDate: "2026-10-18" },
+  ];
+  const extended = proposeBlockDateChange(phases, { startDate: "2026-09-21", endDate: "2026-10-18" }, { startDate: "2026-09-14", endDate: "2026-10-25" });
+  assert.equal(extended[0].startDate, "2026-09-14");
+  assert.equal(extended[1].endDate, "2026-10-25");
+  const trimmed = proposeBlockDateChange(phases, { startDate: "2026-09-21", endDate: "2026-10-18" }, { startDate: "2026-09-28", endDate: "2026-10-11" });
+  assert.equal(trimmed[0].startDate, "2026-09-28");
+  assert.equal(trimmed[1].endDate, "2026-10-11");
+  assert.equal(phaseCoverageError(trimmed, { startDate: "2026-09-28", endDate: "2026-10-11" }), null);
+});
+
+test("fresh and reset seeds finish on data version 2.3", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    const [marker] = await db.select().from(schema.appMetadata).where(eq(schema.appMetadata.key, "data-version"));
+    assert.equal(marker.value, "2.3");
+    await resetTrainingData(db);
+    const [afterReset] = await db.select().from(schema.appMetadata).where(eq(schema.appMetadata.key, "data-version"));
+    assert.equal(afterReset.value, "2.3");
+  } finally { await miniflare.dispose(); }
+});
+
+test("recommendation provenance distinguishes defaults from explicit progression choices", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    const [week] = await db.select().from(schema.plannedWeeks).where(eq(schema.plannedWeeks.id, "week-2026-09-21"));
+    const [recommendation] = await db.select().from(schema.programmeWeekRecommendations).where(eq(schema.programmeWeekRecommendations.weekId, week.id));
+    assert.equal(recommendation.progressionIsOverride, false);
+    await db.update(schema.programmeWeekRecommendations).set({ progressionTrackId: "track-lt2-running", progressionIsOverride: true }).where(eq(schema.programmeWeekRecommendations.weekId, week.id));
+    const [explicit] = await db.select().from(schema.programmeWeekRecommendations).where(eq(schema.programmeWeekRecommendations.weekId, week.id));
+    assert.equal(explicit.progressionIsOverride, true);
+    await setProgrammeWeekType(db, week.id, "week-type-everlast");
+    const [reset] = await db.select().from(schema.programmeWeekRecommendations).where(eq(schema.programmeWeekRecommendations.weekId, week.id));
+    assert.equal(reset.progressionIsOverride, false);
+    assert.equal(reset.progressionTrackId, null);
+  } finally { await miniflare.dispose(); }
+});
+
+test("explicit progression is retained only when the replacement template has a quality slot", () => {
+  const recommendation = { progressionTrackId: "track-lt2-running", progressionIsOverride: true };
+  assert.equal(hasExplicitProgressionConflict(recommendation, [{ isQualityIntent: true }]), false);
+  assert.equal(hasExplicitProgressionConflict(recommendation, [{ isQualityIntent: false }]), true);
+  assert.equal(hasExplicitProgressionConflict({ progressionTrackId: "track-lt2-running", progressionIsOverride: false }, [{ isQualityIntent: false }]), false);
 });
