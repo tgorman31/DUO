@@ -13,6 +13,7 @@ import { ensureSeeded, rebuildWeekSessions, resetTrainingData, type TrainingDb }
 import {
   reconcileRecommendedWeek,
   reconcileV2RecommendedWeek,
+  applyWeekTypeToProgrammeWeek,
   setProgrammeWeekType,
   unsetWeekPlanningState,
 } from "@/db/week-planning";
@@ -53,6 +54,7 @@ import {
   trainingLocations,
   weekTypeDayIntents,
   weekTypeTemplates,
+  workoutHyroxCoverage,
 } from "@/db/schema";
 import {
   addDays,
@@ -328,7 +330,7 @@ async function loadAppData(
   const week = chooseWeek(weekRows, requestedWeekId);
   if (!week) throw new Error("No planned week is available.");
 
-  const [focusRowsV2, catalogueRowsV2, locationRowsV2, equipmentRowsV2, currentLocationRowsV2, priorityRowsV2, builderTemplateRowsV2, builderSlotRowsV2, trackRowsV2, trackStepRowsV2, trackStateRowsV2, weekTypeRowsV2, weekIntentRowsV2, recommendationRowsV2] = await Promise.all([
+  const [focusRowsV2, catalogueRowsV2, locationRowsV2, equipmentRowsV2, currentLocationRowsV2, priorityRowsV2, builderTemplateRowsV2, builderSlotRowsV2, trackRowsV2, trackStepRowsV2, trackStateRowsV2, weekTypeRowsV2, weekIntentRowsV2, recommendationRowsV2, workoutCoverageRowsV2] = await Promise.all([
     db.select().from(trainingFocuses).where(eq(trainingFocuses.active, true)).orderBy(asc(trainingFocuses.name)),
     db.select().from(catalogueExercises).where(eq(catalogueExercises.active, true)).orderBy(asc(catalogueExercises.trainingFocus), asc(catalogueExercises.focusRank)),
     db.select().from(trainingLocations).where(eq(trainingLocations.active, true)).orderBy(asc(trainingLocations.name)),
@@ -343,6 +345,7 @@ async function loadAppData(
     db.select().from(weekTypeTemplates).where(eq(weekTypeTemplates.active, true)).orderBy(asc(weekTypeTemplates.name)),
     db.select().from(weekTypeDayIntents).orderBy(asc(weekTypeDayIntents.day)),
     db.select().from(programmeWeekRecommendations),
+    db.select().from(workoutHyroxCoverage),
   ]);
 
   const [sessionRows, originalRows, allSessionRows, feedRows, recentRows, historyRows] =
@@ -797,6 +800,7 @@ async function loadAppData(
     })),
     weekTypeTemplates: weekTypeRowsV2.map((template) => ({ ...template, intents: weekIntentRowsV2.filter((intent) => intent.weekTypeId === template.id).sort((a, b) => a.day - b.day) })),
     programmeRecommendations: recommendationRowsV2,
+    workoutCoverage: Object.fromEntries(allLibraryRows.map((workout) => [workout.id, workoutCoverageRowsV2.filter((row) => row.workoutId === workout.id).map((row) => ({ station: row.station, exposure: row.exposure === "supporting" ? "supporting" as const : "direct" as const }))])),
   };
 
   return {
@@ -1756,6 +1760,36 @@ export async function POST(request: Request) {
         .update(plannedWeeks)
         .set({ status: "in_progress", updatedAt: nowIso() })
         .where(eq(plannedWeeks.id, sessionRow.weekId));
+      // Programme progression advances only when this exact planned step is
+      // completed. A replacement/missed session therefore cannot jump a track.
+      const [progressionWeek] = await db.select({ snapshot: plannedWeeks.programmeSnapshotJson }).from(plannedWeeks).where(eq(plannedWeeks.id, sessionRow.weekId)).limit(1);
+      const snapshot = parseJson<{ recommendation?: { progressionTrackId?: string | null }; intents?: Array<{ day?: number; progressionTrackId?: string | null }> }>(progressionWeek?.snapshot ?? "{}", {});
+      const plannedTrackId = snapshot.intents?.find((intent) => intent.day === sessionRow.sortOrder)?.progressionTrackId ?? snapshot.recommendation?.progressionTrackId ?? null;
+      if (plannedTrackId) {
+        const [track] = await db.select().from(progressionTracks).where(eq(progressionTracks.id, plannedTrackId)).limit(1);
+        const steps = track ? await db.select().from(progressionSteps).where(eq(progressionSteps.trackId, plannedTrackId)).orderBy(asc(progressionSteps.sortOrder)) : [];
+        const states = await db.select().from(progressionStatesV2).where(eq(progressionStatesV2.trackId, plannedTrackId));
+        const sharedStep = Math.min(...["thomas", "kt"].map((athleteId) => states.find((state) => state.athleteId === athleteId)?.currentStep ?? 0));
+        const expectedIndex = sessionRow.assignment === "together" ? sharedStep : states.find((state) => state.athleteId === actor.id)?.currentStep ?? 0;
+        const expected = steps[Math.min(expectedIndex, Math.max(steps.length - 1, 0))];
+        if (expected && (sessionRow.title === expected.title || sessionRow.title.includes(expected.title))) {
+          const next = Math.min(expectedIndex + 1, steps.length);
+          if (sessionRow.assignment === "together") {
+            const linked = sessionRow.sharedSessionId ? await db.select().from(athleteSessions).where(eq(athleteSessions.sharedSessionId, sessionRow.sharedSessionId)) : [];
+            const bothDone = ["thomas", "kt"].every((athleteId) => linked.some((row) => row.athleteId === athleteId && row.status === "completed"));
+            if (bothDone) {
+              for (const athleteId of ["thomas", "kt"]) await db.insert(progressionStatesV2).values({ athleteId, trackId: plannedTrackId, currentStep: next, togetherPending: false, updatedAt: nowIso() }).onConflictDoUpdate({ target: [progressionStatesV2.athleteId, progressionStatesV2.trackId], set: { currentStep: next, togetherPending: false, updatedAt: nowIso() } });
+              progressionMessages.push(`${track?.name ?? "Progression"}: completed by both — next step ready`);
+            } else {
+              await db.insert(progressionStatesV2).values({ athleteId: actor.id, trackId: plannedTrackId, currentStep: expectedIndex, togetherPending: true, updatedAt: nowIso() }).onConflictDoUpdate({ target: [progressionStatesV2.athleteId, progressionStatesV2.trackId], set: { currentStep: expectedIndex, togetherPending: true, updatedAt: nowIso() } });
+              progressionMessages.push(`${track?.name ?? "Progression"}: waiting for partner completion`);
+            }
+          } else {
+            await db.insert(progressionStatesV2).values({ athleteId: actor.id, trackId: plannedTrackId, currentStep: next, togetherPending: false, updatedAt: nowIso() }).onConflictDoUpdate({ target: [progressionStatesV2.athleteId, progressionStatesV2.trackId], set: { currentStep: next, togetherPending: false, updatedAt: nowIso() } });
+            progressionMessages.push(`${track?.name ?? "Progression"}: advanced to the next step`);
+          }
+        }
+      }
       const paceNote = averagePace ? ` — ${averagePace}/km avg rep pace` : "";
       await createActivity(
         db,
@@ -1835,6 +1869,11 @@ export async function POST(request: Request) {
           .insert(workoutFavourites)
           .values({ athleteId: actor.id, workoutId: id })
           .onConflictDoNothing();
+      }
+      if (family === "hyrox") {
+        const stations = Array.isArray(body.directHyroxStations) ? [...new Set(body.directHyroxStations.filter((item): item is string => typeof item === "string" && V2_HYROX_STATIONS.includes(item as (typeof V2_HYROX_STATIONS)[number])))] : [];
+        await db.delete(workoutHyroxCoverage).where(eq(workoutHyroxCoverage.workoutId, id));
+        if (stations.length) await db.insert(workoutHyroxCoverage).values(stations.map((station) => ({ workoutId: id, station, exposure: "direct" })));
       }
       return Response.json({ ok: true, workoutId: id });
     }
@@ -2142,7 +2181,36 @@ export async function POST(request: Request) {
       if (!template) return apiError("Week Type not found.", 404);
       const update = { name: asString(body.name, template.name), rationale: asString(body.rationale, template.rationale), hardTarget: Math.max(0, Math.round(asNumber(body.hardTarget, template.hardTarget) ?? template.hardTarget)), strengthTarget: Math.max(0, Math.round(asNumber(body.strengthTarget, template.strengthTarget) ?? template.strengthTarget)), easyTarget: Math.max(0, Math.round(asNumber(body.easyTarget, template.easyTarget) ?? template.easyTarget)), priorityEmphasis: asString(body.priorityEmphasis, template.priorityEmphasis), updatedAt: nowIso() };
       await db.update(weekTypeTemplates).set(update).where(eq(weekTypeTemplates.id, templateId));
+      if (Array.isArray(body.intents)) {
+        const intents = body.intents as Array<Record<string, unknown>>;
+        if (intents.length !== 7) return apiError("A Week Type needs all seven daily intents.", 422);
+        await db.delete(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, templateId));
+        const rows = intents.map((item, day) => ({ id: `${templateId}-${day}`, weekTypeId: templateId, day, intent: asString(item.intent, "Rest / recovery"), workoutId: asString(item.workoutId) || null, strengthTemplateId: asString(item.strengthTemplateId) || null, progressionTrackId: asString(item.progressionTrackId) || null, locationId: asString(item.locationId) || null, priorityEmphasis: asString(item.priorityEmphasis, "balanced"), category: asString(item.category, "recovery"), workoutKind: asString(item.workoutKind, "recovery"), details: asString(item.details), isQualityIntent: Boolean(item.isQualityIntent) }));
+        for (const batch of d1InsertBatches(rows)) await db.insert(weekTypeDayIntents).values(batch);
+      }
       return Response.json({ ok: true, templateId });
+    }
+
+    if (action === "duplicateWeekType") {
+      const sourceId = asString(body.templateId);
+      const [source] = await db.select().from(weekTypeTemplates).where(eq(weekTypeTemplates.id, sourceId)).limit(1);
+      if (!source) return apiError("Week Type not found.", 404);
+      const id = `week-type-custom-${crypto.randomUUID()}`;
+      await db.insert(weekTypeTemplates).values({ ...source, id, name: asString(body.name, `${source.name} copy`), isBuiltIn: false, baseJson: "{}", createdAt: nowIso(), updatedAt: nowIso() });
+      const intents = await db.select().from(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, sourceId));
+      if (intents.length) await db.insert(weekTypeDayIntents).values(intents.map((intent) => ({ ...intent, id: `${id}-${intent.day}`, weekTypeId: id })));
+      return Response.json({ ok: true, templateId: id });
+    }
+
+    if (action === "updateFutureWeeksFromWeekType") {
+      const templateId = asString(body.templateId);
+      const [template] = await db.select().from(weekTypeTemplates).where(eq(weekTypeTemplates.id, templateId)).limit(1);
+      if (!template) return apiError("Week Type not found.", 404);
+      const recommendations = await db.select().from(programmeWeekRecommendations).where(eq(programmeWeekRecommendations.weekTypeId, templateId));
+      const weeks = await db.select().from(plannedWeeks).where(inArray(plannedWeeks.id, recommendations.map((row) => row.weekId)));
+      const eligible = weeks.filter((week) => week.startDate >= todayIso() && !week.confirmedAt && !["in_progress", "complete"].includes(week.status));
+      for (const week of eligible) await applyWeekTypeToProgrammeWeek(db, week.id, templateId);
+      return Response.json({ ok: true, eligibleWeekIds: eligible.map((week) => week.id) });
     }
 
     if (action === "updateProgrammeWeek") {
@@ -2150,7 +2218,9 @@ export async function POST(request: Request) {
       const [week] = await db.select().from(plannedWeeks).where(eq(plannedWeeks.id, weekId)).limit(1);
       if (!week) return apiError("Programme week not found.", 404);
       if (week.confirmedAt || week.status === "in_progress") return apiError("Set or in-progress weeks require normal Week editing.", 409);
+      const previousRecommendation = await db.select().from(programmeWeekRecommendations).where(eq(programmeWeekRecommendations.weekId, weekId)).limit(1).then((rows) => rows[0]);
       const recommendation = { title: asString(body.title, week.title), rationale: asString(body.rationale, week.rationale), qualityIntent: asString(body.qualityIntent, week.qualityFocus), weekTypeId: asString(body.weekTypeId) || null, phaseId: asString(body.phaseId) || null, progressionTrackId: asString(body.progressionTrackId) || null };
+      if (recommendation.weekTypeId && recommendation.weekTypeId !== previousRecommendation?.weekTypeId) await setProgrammeWeekType(db, weekId, recommendation.weekTypeId);
       const legacyWeekType = recommendation.weekTypeId?.startsWith("week-type-") ? recommendation.weekTypeId.slice("week-type-".length) : week.weekType;
       await db.update(plannedWeeks).set({ title: recommendation.title, rationale: recommendation.rationale, qualityFocus: recommendation.qualityIntent, weekType: legacyWeekType, programmeWeekTypeId: recommendation.weekTypeId, programmePhaseId: recommendation.phaseId, updatedAt: nowIso() }).where(eq(plannedWeeks.id, weekId));
       await db.insert(programmeWeekRecommendations).values({ id: `programme-recommendation-${weekId}`, weekId, ...recommendation, updatedAt: nowIso() }).onConflictDoUpdate({ target: programmeWeekRecommendations.weekId, set: { ...recommendation, updatedAt: nowIso() } });
@@ -2258,7 +2328,49 @@ export async function POST(request: Request) {
       return Response.json({ ok: true, reference: "DUO base programme" });
     }
 
-    if (action === "updatePhase") {
+    if (action === "updateBlock") {
+      const blockId = asString(body.blockId);
+      const [block] = await db.select().from(trainingBlocks).where(eq(trainingBlocks.id, blockId)).limit(1);
+      if (!block) return apiError("Training block not found.", 404);
+      const startDate = asString(body.startDate, block.startDate);
+      const endDate = asString(body.endDate, block.endDate);
+      if (!asString(body.name, block.name) || startDate > endDate) return apiError("Block name and valid dates are required.");
+      const phasesOutside = await db.select().from(trainingPhases).where(and(eq(trainingPhases.blockId, blockId), sql`${trainingPhases.startDate} < ${startDate} or ${trainingPhases.endDate} > ${endDate}`));
+      if (phasesOutside.length) return apiError("Update the affected phase dates before shortening this block.", 409);
+      await db.update(trainingBlocks).set({ name: asString(body.name, block.name), startDate, endDate, trainingGoal: asString(body.trainingGoal, block.trainingGoal), notes: asString(body.notes, block.notes) }).where(eq(trainingBlocks.id, blockId));
+      return Response.json({ ok: true });
+    }
+
+    if (action === "createPhase" || action === "updatePhase") {
+      const phaseId = asString(body.phaseId);
+      const existing = phaseId ? await db.select().from(trainingPhases).where(eq(trainingPhases.id, phaseId)).limit(1).then((rows) => rows[0]) : null;
+      const blockId = asString(body.blockId, existing?.blockId ?? "");
+      const [block] = await db.select().from(trainingBlocks).where(eq(trainingBlocks.id, blockId)).limit(1);
+      if (!block) return apiError("Training block not found.", 404);
+      const name = asString(body.name, existing?.name ?? "");
+      const startDate = asString(body.startDate, existing?.startDate ?? "");
+      const endDate = asString(body.endDate, existing?.endDate ?? "");
+      if (!name || !startDate || !endDate || startDate > endDate || startDate < block.startDate || endDate > block.endDate) return apiError("Use valid phase dates inside the training block.");
+      const overlapping = await db.select().from(trainingPhases).where(and(eq(trainingPhases.blockId, blockId), sql`${trainingPhases.startDate} <= ${endDate} and ${trainingPhases.endDate} >= ${startDate}`));
+      if (overlapping.some((phase) => phase.id !== existing?.id)) return apiError("Phase dates cannot overlap another phase.", 409);
+      const id = existing?.id ?? `phase-${crypto.randomUUID()}`;
+      const values = { blockId, name, startDate, endDate, focus: asString(body.focus, existing?.focus ?? ""), sortOrder: Math.max(0, Math.round(asNumber(body.sortOrder, existing?.sortOrder ?? (await db.select({ count: sql<number>`count(*)` }).from(trainingPhases).where(eq(trainingPhases.blockId, blockId)))[0]?.count ?? 0) ?? 0)) };
+      if (existing) await db.update(trainingPhases).set(values).where(eq(trainingPhases.id, id)); else await db.insert(trainingPhases).values({ id, ...values });
+      return Response.json({ ok: true, phaseId: id });
+    }
+
+    if (action === "deletePhase") {
+      const phaseId = asString(body.phaseId);
+      const [phase] = await db.select().from(trainingPhases).where(eq(trainingPhases.id, phaseId)).limit(1);
+      if (!phase) return apiError("Phase not found.", 404);
+      const protectedWeeks = await db.select().from(plannedWeeks).where(and(eq(plannedWeeks.blockId, phase.blockId), sql`${plannedWeeks.startDate} between ${phase.startDate} and ${phase.endDate}`, sql`${plannedWeeks.confirmedAt} is not null or ${plannedWeeks.status} in ('in_progress', 'complete')`));
+      if (protectedWeeks.length) return apiError("This phase contains Set or historical weeks. Reassign eligible future weeks instead.", 409);
+      await db.update(programmeWeekRecommendations).set({ phaseId: null, updatedAt: nowIso() }).where(eq(programmeWeekRecommendations.phaseId, phaseId));
+      await db.delete(trainingPhases).where(eq(trainingPhases.id, phaseId));
+      return Response.json({ ok: true });
+    }
+
+    if (action === "legacyUpdatePhase") {
       const phaseId = asString(body.phaseId);
       const [phase] = await db.select().from(trainingPhases).where(eq(trainingPhases.id, phaseId)).limit(1);
       if (!phase) return apiError("Phase not found.", 404);

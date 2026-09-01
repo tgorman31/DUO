@@ -104,6 +104,19 @@ function Prescription({ workout, fallback }: { workout: LibraryItem | null; fall
   );
 }
 
+function HyroxCoverage({ session, data }: { session: Session; data: AppData }) {
+  const direct = session.workoutTemplateId ? data.v2.workoutCoverage[session.workoutTemplateId] ?? [] : [];
+  const templateId = session.workout?.strengthTemplateId ?? (session.workoutKind === "strength-a" ? "strength-template-a" : session.workoutKind === "strength-b" ? "strength-template-b" : null);
+  const supporting = templateId ? data.v2.strengthTemplates.find((template) => template.id === templateId)?.slots.flatMap((slot) => data.v2.catalogue.find((exercise) => exercise.id === slot.exerciseId)?.helpsWith ?? []).map((station) => ({ station, exposure: "supporting" as const })) ?? [] : [];
+  const coverage = [...direct, ...supporting].filter((item, index, items) => items.findIndex((other) => other.station === item.station && other.exposure === item.exposure) === index);
+  if (!coverage.length) return null;
+  const priorityTags = coverage.flatMap((item) => data.athletes.flatMap((athlete) => {
+    const rank = data.v2.priorities[athlete.id]?.indexOf(item.station);
+    return rank === undefined || rank < 0 ? [] : [`${athlete.athleteKey === "thomas" ? "TG" : "KT"} #${rank + 1}`];
+  }));
+  return <section className="performance-card hyrox-coverage-card"><SectionHeading eyebrow="HYROX areas hit" title="Coverage" /><div className="hyrox-coverage-list">{coverage.map((item) => <div key={`${item.station}-${item.exposure}`}><strong>{item.station}</strong><span>{item.exposure}</span></div>)}</div>{priorityTags.length ? <p className="coverage-priority-line"><strong>Priorities hit</strong> {priorityTags.join(" · ")}</p> : null}</section>;
+}
+
 function PreviousResult({ session, data }: { session: Session; data: AppData }) {
   const last = data.recentSessions.find(
     (item) => item.athleteId === data.actor.id && item.id !== session.id && (session.workoutTemplateId ? item.workoutTemplateId === session.workoutTemplateId : item.title === session.title),
@@ -388,6 +401,7 @@ export function TrainView({ data, mutate, route, onNavigate }: { data: AppData; 
     <div className="view-stack">
       {todayRest ? <section className="rest-status-card"><Moon aria-hidden="true" /><div><p className="eyebrow">Today</p><h2>Rest / Recovery</h2><p>No structured training planned today.</p><span>Next training: {formatDay(selected.scheduledDate)} — {selected.title}</span></div><Button variant="outline" size="sm" onClick={() => mutate({ action: "markRestComplete", sessionId: todayRest.id }, "Recovery day marked complete")}>Mark day complete</Button></section> : null}
       <section className="train-hero train-overview-hero"><div className="train-hero-icon"><Gauge aria-hidden="true" /></div><p className="eyebrow">Workout overview</p><h1>{selected.title}</h1><p>{selected.workout?.purpose || selected.details}</p><div className="train-hero-meta"><CategoryBadge category={selected.category} /><span><Timer aria-hidden="true" /> {formatDay(selected.scheduledDate)}</span></div></section>
+      <HyroxCoverage session={selected} data={data} />
       <section className="performance-card session-location-card"><div className="field-stack"><Label htmlFor="session-location">Session location override <span className="optional-label">Optional</span></Label><Select value={selected.locationId ?? "default"} onValueChange={(value) => void mutate({ action: "setSessionLocation", sessionId: selected.id, locationId: value === "default" ? "" : value }, "Session location updated")}><SelectTrigger id="session-location" className="full-select"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="default">Use current location ({data.v2.locations.find((location) => location.id === data.v2.currentLocationId)?.name ?? "none selected"})</SelectItem>{data.v2.locations.map((location) => <SelectItem key={location.id} value={location.id}>{location.name}</SelectItem>)}</SelectContent></Select></div></section>
       {selected.status === "completed" ? <div className="completed-banner"><Check /> Completed · RPE {selected.rpe ?? "—"}</div> : <section className="workout-start-actions"><Button className="start-session-button" onClick={() => onNavigate("train", { sessionId: selected.id, mode: "log" })}>Open workout <ArrowRight /></Button></section>}
       <section className="performance-card training-queue-card"><SectionHeading eyebrow="Your individual plan" title="Training queue" /><Select value={selected.id} onValueChange={(value) => onNavigate("train", { sessionId: value, mode: "log" })}><SelectTrigger className="full-select queue-select"><SelectValue /></SelectTrigger><SelectContent>{actualSessions.map((session) => <SelectItem value={session.id} key={session.id}>{formatDay(session.scheduledDate)} · {session.title}{session.status === "completed" ? " ✓" : ""}</SelectItem>)}</SelectContent></Select><div className="queue-list">{upcoming.slice(0, 4).map((session, queueIndex) => <button className={session.id === selected.id ? "queue-item queue-item-active" : "queue-item"} type="button" key={session.id} onClick={() => onNavigate("train", { sessionId: session.id, mode: "log" })}><span>{queueIndex + 1}</span><div><strong>{session.title}</strong><small>{formatDay(session.scheduledDate)} · {session.assignment === "together" ? "Together" : "Individual"}</small></div><ChevronRight aria-hidden="true" /></button>)}</div></section>

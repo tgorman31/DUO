@@ -429,6 +429,14 @@ export const programmeWeekRecommendations = sqliteTable("programme_week_recommen
   updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 }, (table) => [uniqueIndex("programme_week_recommendation_week_unique").on(table.weekId)]);
 
+/** Explicit conditioning metadata. This deliberately avoids guessing station
+ * coverage from workout names; strength coverage is aggregated separately. */
+export const workoutHyroxCoverage = sqliteTable("workout_hyrox_coverage", {
+  workoutId: text("workout_id").notNull().references(() => workoutLibraryItems.id),
+  station: text("station").notNull(),
+  exposure: text("exposure").notNull().default("direct"),
+}, (table) => [primaryKey({ columns: [table.workoutId, table.station] }), index("workout_hyrox_coverage_station_idx").on(table.station)]);
+
 export const athleteExerciseSettings = sqliteTable(
   "athlete_exercise_settings",
   {

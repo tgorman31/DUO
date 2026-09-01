@@ -21,3 +21,18 @@ test("V2 migration is additive and modal selects use the canonical popover layer
   const select = await readFile(new URL("../components/ui/select.tsx", import.meta.url), "utf8");
   assert.match(select, /relative z-\[130\]/);
 });
+
+test("product completion keeps explicit coverage and safe Programme Designer operations additive", async () => {
+  const migration = await readFile(new URL("../drizzle/0009_v2_product_completion.sql", import.meta.url), "utf8");
+  assert.doesNotMatch(migration, /\bDROP\s+(?:TABLE|COLUMN)\b/i);
+  assert.match(migration, /CREATE TABLE `workout_hyrox_coverage`/);
+  const route = await readFile(new URL("../app/api/app/route.ts", import.meta.url), "utf8");
+  assert.match(route, /action === "updateBlock"/);
+  assert.match(route, /action === "createPhase"/);
+  assert.match(route, /action === "deletePhase"/);
+  assert.match(route, /action === "updateFutureWeeksFromWeekType"/);
+  assert.match(route, /waiting for partner completion/);
+  const train = await readFile(new URL("../components/training/train-view.tsx", import.meta.url), "utf8");
+  assert.match(train, /HYROX areas hit/);
+  assert.match(train, /supporting/);
+});

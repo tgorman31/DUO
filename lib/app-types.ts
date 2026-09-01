@@ -388,6 +388,7 @@ export type V2Data = {
   progressionTracks: ProgressionTrack[];
   weekTypeTemplates: WeekTypeTemplate[];
   programmeRecommendations: ProgrammeRecommendation[];
+  workoutCoverage: Record<string, Array<{ station: string; exposure: "direct" | "supporting" }>>;
 };
 
 export type AppData = {
