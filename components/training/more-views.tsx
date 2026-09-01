@@ -65,6 +65,7 @@ import type {
   TrainingEvent,
 } from "@/lib/app-types";
 import { CategoryBadge, formatDay, SectionHeading } from "./common";
+import { ProgrammeDesignerUI } from "./programme-designer-ui";
 
 const stations = [
   "SkiErg",
@@ -273,7 +274,7 @@ function NewBlockDialog({ open, onOpenChange, mutate }: { open: boolean; onOpenC
   );
 }
 
-function ProgrammeDesigner({ data, mutate }: { data: AppData; mutate: Mutate }) {
+export function LegacyProgrammeDesigner({ data, mutate }: { data: AppData; mutate: Mutate }) {
   const [tab, setTab] = useState("overview");
   const [blockEditor, setBlockEditor] = useState(false);
   const [blockDraft, setBlockDraft] = useState(() => ({ name: data.block.name, startDate: data.block.startDate, endDate: data.block.endDate, trainingGoal: data.block.trainingGoal, notes: data.block.notes }));
@@ -299,7 +300,7 @@ function ProgrammeDesigner({ data, mutate }: { data: AppData; mutate: Mutate }) 
 
 export function BlocksView({ data, mutate }: { data: AppData; mutate: Mutate }) {
   const [open, setOpen] = useState(false);
-  return <><ProgrammeDesigner data={data} mutate={mutate} /><div className="view-stack blocks-secondary"><Button className="create-block-button" onClick={() => setOpen(true)}><CalendarPlus /> New training block</Button><div className="blocks-list">{data.blocks.map((block) => <article className="block-card" key={block.id}><div className="block-status-line"><span>{block.status}</span><small>{formatDay(block.startDate, { weekday: undefined })} → {formatDay(block.endDate, { weekday: undefined })}</small></div><h2>{block.name}</h2><p>{block.trainingGoal}</p><div className="block-event-count"><CalendarCheck /> {data.events.filter((event) => event.blockId === block.id).length} linked events</div></article>)}</div><NewBlockDialog open={open} onOpenChange={setOpen} mutate={mutate} /></div></>;
+  return <><ProgrammeDesignerUI data={data} mutate={mutate} /><div className="view-stack blocks-secondary"><Button className="create-block-button" onClick={() => setOpen(true)}><CalendarPlus /> New training block</Button><div className="blocks-list">{data.blocks.map((block) => <article className="block-card" key={block.id}><div className="block-status-line"><span>{block.status}</span><small>{formatDay(block.startDate, { weekday: undefined })} → {formatDay(block.endDate, { weekday: undefined })}</small></div><h2>{block.name}</h2><p>{block.trainingGoal}</p><div className="block-event-count"><CalendarCheck /> {data.events.filter((event) => event.blockId === block.id).length} linked events</div></article>)}</div><NewBlockDialog open={open} onOpenChange={setOpen} mutate={mutate} /></div></>;
 }
 
 const workoutFamilies = [

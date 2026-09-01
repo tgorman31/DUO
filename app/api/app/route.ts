@@ -2241,6 +2241,20 @@ export async function POST(request: Request) {
       return Response.json({ ok: true });
     }
 
+    if (action === "previewProgrammeWeek") {
+      const weekId = asString(body.weekId);
+      const [week] = await db.select().from(plannedWeeks).where(eq(plannedWeeks.id, weekId)).limit(1);
+      if (!week) return apiError("Programme week not found.", 404);
+      const weekTypeId = asString(body.weekTypeId) || `week-type-${week.weekType}`;
+      const intents = await db.select().from(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, weekTypeId)).orderBy(asc(weekTypeDayIntents.day));
+      const progressionTrackId = asString(body.progressionTrackId);
+      const [track] = progressionTrackId ? await db.select().from(progressionTracks).where(eq(progressionTracks.id, progressionTrackId)).limit(1) : [];
+      const steps = track ? await db.select().from(progressionSteps).where(eq(progressionSteps.trackId, track.id)).orderBy(asc(progressionSteps.sortOrder)) : [];
+      const [state] = progressionTrackId ? await db.select().from(progressionStatesV2).where(and(eq(progressionStatesV2.trackId, progressionTrackId), eq(progressionStatesV2.athleteId, actor.id))).limit(1) : [];
+      const qualityDay = intents.find((intent) => intent.isQualityIntent)?.day;
+      return Response.json({ ok: true, days: intents.map((intent) => { const step = intent.day === qualityDay && track && steps.length && (state?.currentStep ?? 0) < steps.length ? steps[state?.currentStep ?? 0] : null; return { day: intent.day, title: step?.title ?? intent.intent, category: step ? "hard" : intent.category, workoutKind: step ? "run-quality" : intent.workoutKind, locationId: intent.locationId }; }) });
+    }
+
     if (action === "completeProgressionStep") {
       const trackId = asString(body.trackId);
       const [track] = await db.select().from(progressionTracks).where(eq(progressionTracks.id, trackId)).limit(1);
