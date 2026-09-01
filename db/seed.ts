@@ -21,6 +21,7 @@ import {
   trainingPhases,
   trainingTeams,
   workoutLibraryItems,
+  workoutHyroxCoverage,
   workoutFavourites,
   workoutResults,
   athleteCurrentLocations,
@@ -101,6 +102,9 @@ export async function resetTrainingData(db: TrainingDb) {
   await db.delete(events);
   await db.delete(trainingPhases);
   await db.delete(workoutFavourites);
+  // Coverage is a child of workout_library_items. Clear it before custom
+  // library items so a Factory Reset cannot hit a foreign-key failure.
+  await db.delete(workoutHyroxCoverage);
   await db.delete(athleteHyroxPriorities);
   await db.delete(athleteCurrentLocations);
   await db.delete(exerciseFocusLinks);
@@ -442,6 +446,20 @@ async function ensureV2Data(db: TrainingDb) {
   for (const intent of programmeIntents) {
     await db.update(programmeWeekDayIntents).set({ isQualityIntent: intent.isQualityIntent, locationId: intent.locationId }).where(eq(programmeWeekDayIntents.id, intent.id));
   }
+
+  // Conditioning coverage is explicit metadata, not a name-matching guess.
+  // These rows mirror only stations stated in the built-in prescriptions.
+  const builtInCoverage: Record<string, string[]> = {
+    "lib-hyrox-threshold": ["Running", "Burpee Broad Jumps", "Row"],
+    "lib-compromised": ["Running", "SkiErg", "Sandbag Lunges"],
+    "lib-sharpener": ["Running", "SkiErg", "Burpee Broad Jumps"],
+    "lib-everlast": ["Sled Push", "Sled Pull", "Running"],
+  };
+  for (const [workoutId, stations] of Object.entries(builtInCoverage)) {
+    for (const station of stations) {
+      await db.insert(workoutHyroxCoverage).values({ workoutId, station, exposure: "direct" }).onConflictDoNothing();
+    }
+  }
 }
 
 export async function ensureSeeded(db: TrainingDb) {
@@ -456,13 +474,13 @@ export async function ensureSeeded(db: TrainingDb) {
       .from(appMetadata)
       .where(eq(appMetadata.key, "data-version"))
       .limit(1);
-    if (!versionMarker || versionMarker.value !== "2.1") {
+    if (!versionMarker || versionMarker.value !== "2.2") {
       await ensureV11Data(db);
       await ensureV2Data(db);
       await db
         .insert(appMetadata)
-        .values({ key: "data-version", value: "2.1", updatedAt: new Date().toISOString() })
-        .onConflictDoUpdate({ target: appMetadata.key, set: { value: "2.1", updatedAt: new Date().toISOString() } });
+        .values({ key: "data-version", value: "2.2", updatedAt: new Date().toISOString() })
+        .onConflictDoUpdate({ target: appMetadata.key, set: { value: "2.2", updatedAt: new Date().toISOString() } });
     } else {
       // 0007 is additive; an existing V2 database may have the marker but no
       // programme-week intent rows yet. Backfill only when the new layer is

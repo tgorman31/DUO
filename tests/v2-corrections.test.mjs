@@ -418,3 +418,32 @@ test("catalogue-only completion uses catalogue compatibility history IDs through
     assert.equal(history.workingLoadKg, 42);
   } finally { await miniflare.dispose(); }
 });
+
+test("Factory Reset clears custom workout coverage before custom workout parents", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    await db.insert(schema.workoutLibraryItems).values({ id: "custom-hyrox-reset", ownerAthleteId: "thomas", name: "Reset coverage", family: "hyrox", category: "hard", prescription: "", purpose: "", isBuiltIn: false, deletedAt: null, createdAt: "", updatedAt: "" });
+    await db.insert(schema.workoutHyroxCoverage).values([
+      { workoutId: "custom-hyrox-reset", station: "Running", exposure: "direct" },
+      { workoutId: "custom-hyrox-reset", station: "Row", exposure: "direct" },
+      { workoutId: "custom-hyrox-reset", station: "SkiErg", exposure: "direct" },
+    ]);
+    await db.insert(schema.workoutFavourites).values({ athleteId: "thomas", workoutId: "custom-hyrox-reset" });
+    assert.equal((await db.select().from(schema.workoutHyroxCoverage).where(eq(schema.workoutHyroxCoverage.workoutId, "custom-hyrox-reset"))).length, 3);
+    await resetTrainingData(db);
+    assert.equal((await db.select().from(schema.workoutLibraryItems).where(eq(schema.workoutLibraryItems.id, "custom-hyrox-reset"))).length, 0);
+    assert.equal((await db.select().from(schema.workoutHyroxCoverage).where(eq(schema.workoutHyroxCoverage.workoutId, "custom-hyrox-reset"))).length, 0);
+    assert.equal((await db.select().from(schema.catalogueExercises)).length, 92);
+    assert.equal((await db.select().from(schema.strengthFocusSlots).where(eq(schema.strengthFocusSlots.templateId, "strength-template-a"))).length, 7);
+    assert.equal((await db.select().from(schema.strengthFocusSlots).where(eq(schema.strengthFocusSlots.templateId, "strength-template-b"))).length, 7);
+  } finally { await miniflare.dispose(); }
+});
+
+test("built-in direct workout coverage seeds idempotently", async () => {
+  const { miniflare, db } = await seededDb();
+  try {
+    await ensureSeeded(db);
+    const threshold = await db.select().from(schema.workoutHyroxCoverage).where(eq(schema.workoutHyroxCoverage.workoutId, "lib-hyrox-threshold"));
+    assert.deepEqual(threshold.map((row) => row.station).sort(), ["Burpee Broad Jumps", "Row", "Running"]);
+  } finally { await miniflare.dispose(); }
+});

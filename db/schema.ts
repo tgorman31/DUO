@@ -147,6 +147,8 @@ export const sharedSessions = sqliteTable(
     workoutKind: text("workout_kind").notNull(),
     details: text("details").notNull().default(""),
     workoutTemplateId: text("workout_template_id"),
+    progressionTrackId: text("progression_track_id").references(() => progressionTracks.id),
+    progressionStepId: text("progression_step_id").references(() => progressionSteps.id),
     locationId: text("location_id"),
     assignment: text("assignment").notNull().default("together"),
     sortOrder: integer("sort_order").notNull().default(0),
@@ -169,6 +171,8 @@ export const athleteSessions = sqliteTable(
     workoutKind: text("workout_kind").notNull(),
     details: text("details").notNull().default(""),
     workoutTemplateId: text("workout_template_id"),
+    progressionTrackId: text("progression_track_id").references(() => progressionTracks.id),
+    progressionStepId: text("progression_step_id").references(() => progressionSteps.id),
     locationId: text("location_id"),
     assignment: text("assignment").notNull().default("together"),
     status: text("status").notNull().default("planned"),
@@ -181,6 +185,7 @@ export const athleteSessions = sqliteTable(
     index("athlete_sessions_week_athlete_idx").on(table.weekId, table.athleteId),
     index("athlete_sessions_date_idx").on(table.athleteId, table.scheduledDate),
     index("athlete_sessions_shared_idx").on(table.sharedSessionId),
+    index("athlete_sessions_progression_idx").on(table.progressionTrackId, table.progressionStepId),
   ],
 );
 

@@ -1097,6 +1097,11 @@ export async function POST(request: Request) {
         workoutKind,
         details,
         workoutTemplateId,
+        // Moving a session preserves its explicit progression linkage.
+        // Replacing it with another workout clears that linkage unless a
+        // caller deliberately supplies the same linked step in a future flow.
+        progressionTrackId: replacement ? null : current.progressionTrackId,
+        progressionStepId: replacement ? null : current.progressionStepId,
         updatedAt: nowIso(),
       };
       const affectedBefore = scope === "both" && current.sharedSessionId
@@ -1760,33 +1765,35 @@ export async function POST(request: Request) {
         .update(plannedWeeks)
         .set({ status: "in_progress", updatedAt: nowIso() })
         .where(eq(plannedWeeks.id, sessionRow.weekId));
-      // Programme progression advances only when this exact planned step is
-      // completed. A replacement/missed session therefore cannot jump a track.
-      const [progressionWeek] = await db.select({ snapshot: plannedWeeks.programmeSnapshotJson }).from(plannedWeeks).where(eq(plannedWeeks.id, sessionRow.weekId)).limit(1);
-      const snapshot = parseJson<{ recommendation?: { progressionTrackId?: string | null }; intents?: Array<{ day?: number; progressionTrackId?: string | null }> }>(progressionWeek?.snapshot ?? "{}", {});
-      const plannedTrackId = snapshot.intents?.find((intent) => intent.day === sessionRow.sortOrder)?.progressionTrackId ?? snapshot.recommendation?.progressionTrackId ?? null;
-      if (plannedTrackId) {
+      // Progression identity is written to the session at materialisation.
+      // Completion deliberately never infers an expected step from title text.
+      const plannedTrackId = sessionRow.progressionTrackId;
+      const plannedStepId = sessionRow.progressionStepId;
+      if (plannedTrackId && plannedStepId) {
         const [track] = await db.select().from(progressionTracks).where(eq(progressionTracks.id, plannedTrackId)).limit(1);
         const steps = track ? await db.select().from(progressionSteps).where(eq(progressionSteps.trackId, plannedTrackId)).orderBy(asc(progressionSteps.sortOrder)) : [];
-        const states = await db.select().from(progressionStatesV2).where(eq(progressionStatesV2.trackId, plannedTrackId));
-        const sharedStep = Math.min(...["thomas", "kt"].map((athleteId) => states.find((state) => state.athleteId === athleteId)?.currentStep ?? 0));
-        const expectedIndex = sessionRow.assignment === "together" ? sharedStep : states.find((state) => state.athleteId === actor.id)?.currentStep ?? 0;
-        const expected = steps[Math.min(expectedIndex, Math.max(steps.length - 1, 0))];
-        if (expected && (sessionRow.title === expected.title || sessionRow.title.includes(expected.title))) {
-          const next = Math.min(expectedIndex + 1, steps.length);
+        const expectedIndex = steps.findIndex((step) => step.id === plannedStepId);
+        if (track && expectedIndex >= 0) {
+          const states = await db.select().from(progressionStatesV2).where(eq(progressionStatesV2.trackId, plannedTrackId));
+          const currentFor = (athleteId: string) => states.find((state) => state.athleteId === athleteId)?.currentStep ?? 0;
           if (sessionRow.assignment === "together") {
             const linked = sessionRow.sharedSessionId ? await db.select().from(athleteSessions).where(eq(athleteSessions.sharedSessionId, sessionRow.sharedSessionId)) : [];
-            const bothDone = ["thomas", "kt"].every((athleteId) => linked.some((row) => row.athleteId === athleteId && row.status === "completed"));
+            const bothDone = ["thomas", "kt"].every((athleteId) => linked.some((row) => row.athleteId === athleteId && row.status === "completed" && row.progressionTrackId === plannedTrackId && row.progressionStepId === plannedStepId));
             if (bothDone) {
-              for (const athleteId of ["thomas", "kt"]) await db.insert(progressionStatesV2).values({ athleteId, trackId: plannedTrackId, currentStep: next, togetherPending: false, updatedAt: nowIso() }).onConflictDoUpdate({ target: [progressionStatesV2.athleteId, progressionStatesV2.trackId], set: { currentStep: next, togetherPending: false, updatedAt: nowIso() } });
-              progressionMessages.push(`${track?.name ?? "Progression"}: completed by both — next step ready`);
+              const sharedNext = Math.min(expectedIndex + 1, steps.length);
+              for (const athleteId of ["thomas", "kt"]) {
+                const next = Math.max(currentFor(athleteId), sharedNext);
+                await db.insert(progressionStatesV2).values({ athleteId, trackId: plannedTrackId, currentStep: next, togetherPending: false, updatedAt: nowIso() }).onConflictDoUpdate({ target: [progressionStatesV2.athleteId, progressionStatesV2.trackId], set: { currentStep: next, togetherPending: false, updatedAt: nowIso() } });
+              }
+              progressionMessages.push(`${track.name}: completed by both${sharedNext >= steps.length ? " — progression complete" : " — next step ready"}`);
             } else {
-              await db.insert(progressionStatesV2).values({ athleteId: actor.id, trackId: plannedTrackId, currentStep: expectedIndex, togetherPending: true, updatedAt: nowIso() }).onConflictDoUpdate({ target: [progressionStatesV2.athleteId, progressionStatesV2.trackId], set: { currentStep: expectedIndex, togetherPending: true, updatedAt: nowIso() } });
-              progressionMessages.push(`${track?.name ?? "Progression"}: waiting for partner completion`);
+              await db.insert(progressionStatesV2).values({ athleteId: actor.id, trackId: plannedTrackId, currentStep: Math.max(currentFor(actor.id), expectedIndex), togetherPending: true, updatedAt: nowIso() }).onConflictDoUpdate({ target: [progressionStatesV2.athleteId, progressionStatesV2.trackId], set: { currentStep: Math.max(currentFor(actor.id), expectedIndex), togetherPending: true, updatedAt: nowIso() } });
+              progressionMessages.push(`${track.name}: waiting for partner completion`);
             }
-          } else {
+          } else if (currentFor(actor.id) === expectedIndex) {
+            const next = Math.min(expectedIndex + 1, steps.length);
             await db.insert(progressionStatesV2).values({ athleteId: actor.id, trackId: plannedTrackId, currentStep: next, togetherPending: false, updatedAt: nowIso() }).onConflictDoUpdate({ target: [progressionStatesV2.athleteId, progressionStatesV2.trackId], set: { currentStep: next, togetherPending: false, updatedAt: nowIso() } });
-            progressionMessages.push(`${track?.name ?? "Progression"}: advanced to the next step`);
+            progressionMessages.push(`${track.name}: ${next >= steps.length ? "progression complete" : "advanced to the next step"}`);
           }
         }
       }
@@ -1870,9 +1877,12 @@ export async function POST(request: Request) {
           .values({ athleteId: actor.id, workoutId: id })
           .onConflictDoNothing();
       }
+      // Coverage belongs to the current workout family, never to a historic
+      // version of it. Clear first so HYROX → Running cannot retain stale
+      // direct-station metadata.
+      await db.delete(workoutHyroxCoverage).where(eq(workoutHyroxCoverage.workoutId, id));
       if (family === "hyrox") {
         const stations = Array.isArray(body.directHyroxStations) ? [...new Set(body.directHyroxStations.filter((item): item is string => typeof item === "string" && V2_HYROX_STATIONS.includes(item as (typeof V2_HYROX_STATIONS)[number])))] : [];
-        await db.delete(workoutHyroxCoverage).where(eq(workoutHyroxCoverage.workoutId, id));
         if (stations.length) await db.insert(workoutHyroxCoverage).values(stations.map((station) => ({ workoutId: id, station, exposure: "direct" })));
       }
       return Response.json({ ok: true, workoutId: id });

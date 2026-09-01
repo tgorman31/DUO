@@ -219,6 +219,8 @@ export async function reconcileV2RecommendedWeek(
     const intentMeta = intent as { details?: string; category?: string; workoutKind?: string };
     let details = workout?.purpose ?? template?.purpose ?? intentMeta.details ?? intent.intent;
     let resolvedWorkoutId = intent.workoutId ?? workout?.id ?? null;
+    let resolvedProgressionTrackId: string | null = null;
+    let resolvedProgressionStepId: string | null = null;
     let category = workout?.category ?? intentMeta.category ?? (intent.intent.toLowerCase().includes("rest") || intent.intent.toLowerCase().includes("recovery") ? "recovery" : intent.intent.toLowerCase().includes("strength") ? "strength" : intent.intent.toLowerCase().includes("easy") ? "easy" : "hard");
     let workoutKind = workout?.family === "strength" || template ? (template?.id === "strength-template-b" ? "strength-b" : template?.id === "strength-template-a" ? "strength-a" : "strength-custom") : category === "recovery" ? "recovery" : intentMeta.workoutKind || workout?.family || category;
 
@@ -237,7 +239,10 @@ export async function reconcileV2RecommendedWeek(
             ? states.find((row) => row.athleteId === options.athleteId)
             : undefined;
         const steps = await db.select().from(progressionSteps).where(eq(progressionSteps.trackId, track.id)).orderBy(progressionSteps.sortOrder);
-        const step = steps[Math.min(state?.currentStep ?? 0, Math.max(steps.length - 1, 0))];
+        const currentStep = state?.currentStep ?? 0;
+        // `steps.length` is an explicit completed state. Do not silently loop
+        // the final stimulus back into a newly materialised week.
+        const step = currentStep >= steps.length ? null : steps[currentStep];
         if (step) {
           const linkedWorkout = step.workoutId ? await db.select().from(workoutLibraryItems).where(eq(workoutLibraryItems.id, step.workoutId)).limit(1).then((rows) => rows[0]) : null;
           title = linkedWorkout?.name ?? step.title;
@@ -246,6 +251,14 @@ export async function reconcileV2RecommendedWeek(
           workoutKind = linkedWorkout?.family ?? workoutKind;
           workout = linkedWorkout ?? workout;
           resolvedWorkoutId = linkedWorkout?.id ?? null;
+          resolvedProgressionTrackId = track.id;
+          resolvedProgressionStepId = step.id;
+        } else if (currentStep >= steps.length) {
+          title = `${track.name} — Progression complete`;
+          details = "Progression complete. Choose another progression or restart it deliberately in Programme Designer.";
+          category = "recovery";
+          workoutKind = "progression-complete";
+          resolvedWorkoutId = null;
         }
       }
     }
@@ -258,18 +271,20 @@ export async function reconcileV2RecommendedWeek(
       workoutKind,
       details,
       workoutTemplateId: resolvedWorkoutId,
+      progressionTrackId: resolvedProgressionTrackId,
+      progressionStepId: resolvedProgressionStepId,
       locationId: intent.locationId ?? options.defaultLocationId ?? null,
       assignment: "together",
       sortOrder: intent.day,
     };
-    await db.insert(sharedSessions).values(row).onConflictDoUpdate({ target: sharedSessions.id, set: { scheduledDate: row.scheduledDate, title: row.title, category: row.category, workoutKind: row.workoutKind, details: row.details, workoutTemplateId: row.workoutTemplateId, locationId: row.locationId, assignment: row.assignment, sortOrder: row.sortOrder, updatedAt: now } });
+    await db.insert(sharedSessions).values(row).onConflictDoUpdate({ target: sharedSessions.id, set: { scheduledDate: row.scheduledDate, title: row.title, category: row.category, workoutKind: row.workoutKind, details: row.details, workoutTemplateId: row.workoutTemplateId, progressionTrackId: row.progressionTrackId, progressionStepId: row.progressionStepId, locationId: row.locationId, assignment: row.assignment, sortOrder: row.sortOrder, updatedAt: now } });
     materialized.push(row);
     for (const athleteId of ATHLETE_IDS) {
       const id = `session-${athleteId}-${week.id}-${intent.day}`;
       desired.add(id);
       const existing = currentAthleteRows.find((item) => item.id === id);
       if (existing?.status === "completed") continue;
-      const values = { id, weekId: week.id, sharedSessionId: row.id, athleteId, scheduledDate: row.scheduledDate, title: row.title, category: row.category, workoutKind: row.workoutKind, details: row.details, workoutTemplateId: row.workoutTemplateId, locationId: row.locationId, assignment: row.assignment, status: activate ? "planned" : "removed", completedAt: null, sortOrder: row.sortOrder, updatedAt: now };
+      const values = { id, weekId: week.id, sharedSessionId: row.id, athleteId, scheduledDate: row.scheduledDate, title: row.title, category: row.category, workoutKind: row.workoutKind, details: row.details, workoutTemplateId: row.workoutTemplateId, progressionTrackId: row.progressionTrackId, progressionStepId: row.progressionStepId, locationId: row.locationId, assignment: row.assignment, status: activate ? "planned" : "removed", completedAt: null, sortOrder: row.sortOrder, updatedAt: now };
       if (existing) await db.update(athleteSessions).set(values).where(eq(athleteSessions.id, id));
       else await db.insert(athleteSessions).values(values);
     }
