@@ -364,6 +364,7 @@ export type WeekTypeTemplate = {
   defaultLocationId: string | null;
   priorityEmphasis: string;
   isBuiltIn: boolean;
+  active: boolean;
   intents: Array<{ id: string; day: number; intent: string; workoutId: string | null; strengthTemplateId: string | null; progressionTrackId: string | null; locationId: string | null; priorityEmphasis: string; category?: Category; workoutKind?: string; details?: string; isQualityIntent?: boolean }>;
 };
 

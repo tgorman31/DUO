@@ -2256,6 +2256,9 @@ export async function POST(request: Request) {
     }
 
     if (action === "completeProgressionStep") {
+      // The normal product path uses completeProgressionForSession below; its
+      // Together response deliberately says "waiting for partner completion"
+      // rather than advancing a shared track after one athlete.
       const trackId = asString(body.trackId);
       const [track] = await db.select().from(progressionTracks).where(eq(progressionTracks.id, trackId)).limit(1);
       if (!track) return apiError("Progression track not found.", 404);
@@ -2353,7 +2356,29 @@ export async function POST(request: Request) {
     }
 
     if (action === "viewDuoBase") {
-      return Response.json({ ok: true, reference: "DUO base programme" });
+      const templateId = asString(body.templateId);
+      if (!templateId) return Response.json({ ok: true, reference: "DUO base programme" });
+      const [template] = await db.select().from(weekTypeTemplates).where(eq(weekTypeTemplates.id, templateId)).limit(1);
+      if (!template) return apiError("Week Type not found.", 404);
+      let base: Record<string, unknown> = {};
+      try { base = JSON.parse(template.baseJson || "{}"); } catch { base = {}; }
+      const intents = await db.select().from(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, templateId)).orderBy(asc(weekTypeDayIntents.day));
+      return Response.json({ ok: true, template: { ...template, name: asString(base.name, template.name), rationale: asString(base.rationale, template.rationale), hardTarget: Number(base.hardTarget ?? template.hardTarget), strengthTarget: Number(base.strengthTarget ?? template.strengthTarget), easyTarget: Number(base.easyTarget ?? template.easyTarget), priorityEmphasis: asString(base.priorityEmphasis, template.priorityEmphasis), intents: Array.isArray(base.intents) && base.intents.length === 7 ? base.intents : intents } });
+    }
+
+    if (action === "resetWeekTypeTemplate") {
+      const templateId = asString(body.templateId);
+      const [template] = await db.select().from(weekTypeTemplates).where(and(eq(weekTypeTemplates.id, templateId), eq(weekTypeTemplates.isBuiltIn, true))).limit(1);
+      if (!template) return apiError("Only a built-in Week Type can be reset.", 404);
+      let base: Record<string, unknown> = {};
+      try { base = JSON.parse(template.baseJson || "{}"); } catch { base = {}; }
+      const baseIntents = Array.isArray(base.intents) ? base.intents as Array<Record<string, unknown>> : [];
+      if (baseIntents.length !== 7) return apiError("The DUO base for this Week Type is incomplete.", 409);
+      const rows = baseIntents.map((item, index) => ({ id: `${templateId}-${asNumber(item.day, index)}`, weekTypeId: templateId, day: asNumber(item.day, index) as number, intent: asString(item.intent, "Rest / recovery"), workoutId: asString(item.workoutId) || null, strengthTemplateId: asString(item.strengthTemplateId) || null, progressionTrackId: asString(item.progressionTrackId) || null, locationId: asString(item.locationId) || null, priorityEmphasis: asString(item.priorityEmphasis, "balanced"), category: asString(item.category, "recovery"), workoutKind: asString(item.workoutKind, "recovery"), details: asString(item.details), isQualityIntent: Boolean(item.isQualityIntent) }));
+      await db.update(weekTypeTemplates).set({ name: asString(base.name, template.name), rationale: asString(base.rationale, template.rationale), hardTarget: Math.max(0, Math.round(asNumber(base.hardTarget, template.hardTarget) ?? template.hardTarget)), strengthTarget: Math.max(0, Math.round(asNumber(base.strengthTarget, template.strengthTarget) ?? template.strengthTarget)), easyTarget: Math.max(0, Math.round(asNumber(base.easyTarget, template.easyTarget) ?? template.easyTarget)), priorityEmphasis: asString(base.priorityEmphasis, template.priorityEmphasis), updatedAt: nowIso() }).where(eq(weekTypeTemplates.id, templateId));
+      await db.delete(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, templateId));
+      for (const batch of d1InsertBatches(rows)) await db.insert(weekTypeDayIntents).values(batch);
+      return Response.json({ ok: true, templateId });
     }
 
     if (action === "updateBlock") {

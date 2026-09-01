@@ -405,6 +405,18 @@ async function ensureV2Data(db: TrainingDb) {
   for (const intent of dayIntents) {
     await db.update(weekTypeDayIntents).set({ category: intent.category, workoutKind: intent.workoutKind, details: intent.details, isQualityIntent: intent.isQualityIntent, locationId: intent.locationId }).where(eq(weekTypeDayIntents.id, intent.id));
   }
+  // Keep the original seven-day recommendation alongside each built-in's
+  // editable current version. This powers a real DUO-base view/reset without
+  // overwriting a customised template on subsequent idempotent seed runs.
+  for (const weekType of weekTypeRows) {
+    const [current] = await db.select({ baseJson: weekTypeTemplates.baseJson }).from(weekTypeTemplates).where(eq(weekTypeTemplates.id, weekType.id)).limit(1);
+    let base: Record<string, unknown> = {};
+    try { base = JSON.parse(current?.baseJson || "{}"); } catch { base = {}; }
+    if (!Array.isArray(base.intents) || base.intents.length !== 7) {
+      const intents = dayIntents.filter((intent) => intent.weekTypeId === weekType.id).map((intent) => ({ day: intent.day, intent: intent.intent, workoutId: intent.workoutId, strengthTemplateId: intent.strengthTemplateId, progressionTrackId: intent.progressionTrackId, locationId: intent.locationId, priorityEmphasis: intent.priorityEmphasis, category: intent.category, workoutKind: intent.workoutKind, details: intent.details, isQualityIntent: intent.isQualityIntent }));
+      await db.update(weekTypeTemplates).set({ baseJson: JSON.stringify({ ...WEEK_TYPE_INFO[weekType.id.replace("week-type-", "")], intents }), updatedAt: now }).where(eq(weekTypeTemplates.id, weekType.id));
+    }
+  }
   const weeks = await db.select().from(plannedWeeks);
   const phases = await db.select().from(trainingPhases);
   const recommendations = weeks.map((week) => {
