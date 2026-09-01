@@ -2175,12 +2175,21 @@ export async function POST(request: Request) {
       const name = asString(body.name);
       const steps = Array.isArray(body.steps) ? body.steps : [];
       if (!name) return apiError("Progression name is required.");
+      if (!steps.length) return apiError("A progression track needs at least one step.", 422);
       const id = trackId || `track-custom-${crypto.randomUUID()}`;
       const existing = trackId ? await db.select().from(progressionTracks).where(eq(progressionTracks.id, trackId)).limit(1).then((rows) => rows[0]) : null;
+      const rows = steps.map((step, index) => { const item = (step ?? {}) as Record<string, unknown>; return { id: asString(item.id) || `${id}-step-${crypto.randomUUID()}`, trackId: id, workoutId: asString(item.workoutId) || null, title: asString(item.title, `Step ${index + 1}`), prescription: asString(item.prescription), sortOrder: index }; });
+      if (new Set(rows.map((row) => row.id)).size !== rows.length) return apiError("Progression steps need unique identities.", 422);
+      const linkedWorkoutIds = rows.map((row) => row.workoutId).filter((item): item is string => Boolean(item));
+      if (linkedWorkoutIds.length) {
+        const found = await db.select({ id: workoutLibraryItems.id }).from(workoutLibraryItems).where(inArray(workoutLibraryItems.id, linkedWorkoutIds));
+        if (found.length !== new Set(linkedWorkoutIds).size) return apiError("Choose valid Workout Library items for linked progression steps.", 422);
+      }
+      // Validate the whole track before changing its metadata or replacing
+      // steps, so a bad editor submission preserves the previous track.
       if (existing) await db.update(progressionTracks).set({ name, purpose: asString(body.purpose), updatedAt: nowIso() }).where(eq(progressionTracks.id, id));
       else await db.insert(progressionTracks).values({ id, teamId: TEAM_ID, name, purpose: asString(body.purpose), isBuiltIn: false, active: true, updatedAt: nowIso() });
       await db.delete(progressionSteps).where(eq(progressionSteps.trackId, id));
-      const rows = steps.map((step, index) => { const item = (step ?? {}) as Record<string, unknown>; return { id: asString(item.id) || `${id}-step-${crypto.randomUUID()}`, trackId: id, workoutId: asString(item.workoutId) || null, title: asString(item.title, `Step ${index + 1}`), prescription: asString(item.prescription), sortOrder: index }; });
       for (const batch of d1InsertBatches(rows)) await db.insert(progressionSteps).values(batch);
       return Response.json({ ok: true, trackId: id });
     }
@@ -2190,13 +2199,22 @@ export async function POST(request: Request) {
       const [template] = await db.select().from(weekTypeTemplates).where(eq(weekTypeTemplates.id, templateId)).limit(1);
       if (!template) return apiError("Week Type not found.", 404);
       const update = { name: asString(body.name, template.name), rationale: asString(body.rationale, template.rationale), hardTarget: Math.max(0, Math.round(asNumber(body.hardTarget, template.hardTarget) ?? template.hardTarget)), strengthTarget: Math.max(0, Math.round(asNumber(body.strengthTarget, template.strengthTarget) ?? template.strengthTarget)), easyTarget: Math.max(0, Math.round(asNumber(body.easyTarget, template.easyTarget) ?? template.easyTarget)), priorityEmphasis: asString(body.priorityEmphasis, template.priorityEmphasis), updatedAt: nowIso() };
-      await db.update(weekTypeTemplates).set(update).where(eq(weekTypeTemplates.id, templateId));
       if (Array.isArray(body.intents)) {
         const intents = body.intents as Array<Record<string, unknown>>;
-        if (intents.length !== 7) return apiError("A Week Type needs all seven daily intents.", 422);
+        const days = intents.map((item) => asNumber(item.day));
+        if (intents.length !== 7 || new Set(days).size !== 7 || days.some((day) => day === null || day < 0 || day > 6)) return apiError("A Week Type needs seven unique Monday–Sunday intents.", 422);
+        const rows = intents.map((item) => ({ id: `${templateId}-${asNumber(item.day)}`, weekTypeId: templateId, day: asNumber(item.day) as number, intent: asString(item.intent, "Rest / recovery"), workoutId: asString(item.workoutId) || null, strengthTemplateId: asString(item.strengthTemplateId) || null, progressionTrackId: asString(item.progressionTrackId) || null, locationId: asString(item.locationId) || null, priorityEmphasis: asString(item.priorityEmphasis, "balanced"), category: asString(item.category, "recovery"), workoutKind: asString(item.workoutKind, "recovery"), details: asString(item.details), isQualityIntent: Boolean(item.isQualityIntent) }));
+        if (rows.some((row) => !validCategories.has(row.category) || !["balanced", "thomas", "kt"].includes(row.priorityEmphasis))) return apiError("One or more daily intents has an invalid category or priority emphasis.", 422);
+        const [workouts, templates, tracks, locations] = await Promise.all([db.select({ id: workoutLibraryItems.id }).from(workoutLibraryItems), db.select({ id: strengthTemplates.id }).from(strengthTemplates), db.select({ id: progressionTracks.id }).from(progressionTracks), db.select({ id: trainingLocations.id }).from(trainingLocations)]);
+        if (rows.some((row) => (row.workoutId && !workouts.some((item) => item.id === row.workoutId)) || (row.strengthTemplateId && !templates.some((item) => item.id === row.strengthTemplateId)) || (row.progressionTrackId && !tracks.some((item) => item.id === row.progressionTrackId)) || (row.locationId && !locations.some((item) => item.id === row.locationId)))) return apiError("One or more daily intent references an unavailable workout, Strength template, progression or location.", 422);
+        // Only replace the existing day structure after the full payload has
+        // resolved. A malformed editor submission therefore leaves the prior
+        // seven-day Week Type intact.
+        await db.update(weekTypeTemplates).set(update).where(eq(weekTypeTemplates.id, templateId));
         await db.delete(weekTypeDayIntents).where(eq(weekTypeDayIntents.weekTypeId, templateId));
-        const rows = intents.map((item, day) => ({ id: `${templateId}-${day}`, weekTypeId: templateId, day, intent: asString(item.intent, "Rest / recovery"), workoutId: asString(item.workoutId) || null, strengthTemplateId: asString(item.strengthTemplateId) || null, progressionTrackId: asString(item.progressionTrackId) || null, locationId: asString(item.locationId) || null, priorityEmphasis: asString(item.priorityEmphasis, "balanced"), category: asString(item.category, "recovery"), workoutKind: asString(item.workoutKind, "recovery"), details: asString(item.details), isQualityIntent: Boolean(item.isQualityIntent) }));
         for (const batch of d1InsertBatches(rows)) await db.insert(weekTypeDayIntents).values(batch);
+      } else {
+        await db.update(weekTypeTemplates).set(update).where(eq(weekTypeTemplates.id, templateId));
       }
       return Response.json({ ok: true, templateId });
     }
@@ -2366,6 +2384,14 @@ export async function POST(request: Request) {
       const id = existing?.id ?? `phase-${crypto.randomUUID()}`;
       const values = { blockId, name, startDate, endDate, focus: asString(body.focus, existing?.focus ?? ""), sortOrder: Math.max(0, Math.round(asNumber(body.sortOrder, existing?.sortOrder ?? (await db.select({ count: sql<number>`count(*)` }).from(trainingPhases).where(eq(trainingPhases.blockId, blockId)))[0]?.count ?? 0) ?? 0)) };
       if (existing) await db.update(trainingPhases).set(values).where(eq(trainingPhases.id, id)); else await db.insert(trainingPhases).values({ id, ...values });
+      // Phase dates are the programme order. Recalculate only editable future
+      // recommendations, never snapshots or historical weeks.
+      const phases = await db.select().from(trainingPhases).where(eq(trainingPhases.blockId, blockId));
+      const futureWeeks = await db.select().from(plannedWeeks).where(and(eq(plannedWeeks.blockId, blockId), isNull(plannedWeeks.confirmedAt), sql`${plannedWeeks.status} not in ('in_progress', 'complete')`));
+      for (const week of futureWeeks) {
+        const resolved = phases.find((phase) => phase.startDate <= week.startDate && phase.endDate >= week.startDate) ?? null;
+        await db.update(programmeWeekRecommendations).set({ phaseId: resolved?.id ?? null, updatedAt: nowIso() }).where(eq(programmeWeekRecommendations.weekId, week.id));
+      }
       return Response.json({ ok: true, phaseId: id });
     }
 
